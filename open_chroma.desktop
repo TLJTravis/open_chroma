@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=OpenChroma Controls
+Exec=python3 /home/mombery/.local/bin/open_chroma.py
+Icon=/home/mombery/.local/share/icons/openchroma.jpeg
+Type=Application
+Categories=Utility;Settings;
+Terminal=false
