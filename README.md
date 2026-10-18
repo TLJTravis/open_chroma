@@ -13,7 +13,7 @@ OpenChroma is a lightweight, universal control utility designed for Linux. It pr
 - **Per-Profile DPI Control & OSD:** Independent DPI stages with a non-focus-stealing OSD notification popup.
 - **Independent Lighting Controls:** Adjust static colors via a 16M gamut spectrum picker, custom hex codes, or breathing effect modes for mouse and keyboard.
 
----
+
 
 ## Prerequisites & Dependencies
 
@@ -23,3 +23,12 @@ Make sure `xdotool` is installed on your system:
 ```bash
 sudo apt install xdotool   # Debian / Ubuntu / Linux Mint
 sudo dnf install xdotool   # Fedora
+
+---
+
+## Installation
+
+You can install OpenChroma with a single command using `curl`:
+
+```bash
+curl -sSL [https://raw.githubusercontent.com/TLJTravis/open_chroma/main/install.sh](https://raw.githubusercontent.com/TLJTravis/open_chroma/main/install.sh) | bash
