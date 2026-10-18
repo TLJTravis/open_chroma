@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
-#OpenChroma - Universal Peripheral Control Utility for Linux
-#Author: TJ Travis
-#Description: Per-profile key remapping, automated window switching, and Chroma lighting.
+# ==============================================================================
+# OPENCHROMA - UNIVERSAL PERIPHERAL CONTROL UTILITY FOR LINUX
+# Author: TLJTravis
+# Description: Per-profile key remapping, automated window switching, and Chroma lighting.
+# ==============================================================================
 
-import sys, json, os, glob, subprocess
+import sys, json, os, glob, subprocess, logging, threading
 from threading import Thread
 from PyQt6.QtWidgets import (QApplication, QWidget, QGridLayout, QPushButton,
                              QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -15,11 +17,23 @@ from PyQt6.QtGui import QColor, QPainter, QLinearGradient, QMouseEvent, QPen, QF
 from Xlib import X, display, XK
 from Xlib.ext import xtest
 
+# ==============================================================================
+# GLOBAL CONFIGURATION & CONSTANTS
+# ==============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("OpenChroma")
+
 # Path where customized key and profile settings are stored on Linux Mint
 PROFILE_FILE = os.path.expanduser("~/.config/naga_profiles.json")
 
+# Razer USB Vendor ID constant for strict hardware validation
+RAZER_VENDOR_ID = 0x1532
+
 # ==============================================================================
-# 0. DPI OSD NOTIFICATION POPUP (Bottom-Right, 200px Buffer, Zero Focus Grab)
+# 0. DPI OSD NOTIFICATION POPUP WIDGET
 # ==============================================================================
 class DpiOsdOverlay(QLabel):
     def __init__(self):
@@ -124,9 +138,10 @@ class SignalBridge(QWidget):
     window_changed_signal = pyqtSignal(tuple)
 
 class AutoProfileWorker(Thread):
-    def __init__(self, signals_emitter):
+    def __init__(self, signals_emitter, shutdown_event):
         super().__init__()
         self.emitter = signals_emitter
+        self.shutdown_event = shutdown_event
         self.daemon = True
         self.last_seen_window = None
 
@@ -139,42 +154,50 @@ class AutoProfileWorker(Thread):
             name_str = name_res.stdout.strip().lower() if name_res.returncode == 0 else ""
             
             return class_tokens, name_str
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Failed to query active window via xdotool: {e}")
             return [], ""
 
     def run(self):
-        while True:
+        while not self.shutdown_event.is_set():
             class_tokens, window_title = self.get_active_window_info()
             combined_key = (tuple(class_tokens), window_title)
             if combined_key != self.last_seen_window:
                 self.last_seen_window = combined_key
                 self.emitter.window_changed_signal.emit((class_tokens, window_title))
-            import time
-            time.sleep(1.5)
+            
+            if self.shutdown_event.wait(1.5):
+                break
 
 # ==============================================================================
-# 3. SAFE SIDE-KEYPAD INPUT DAEMON
+# 3. LIVE INPUT DAEMON (SIDE-KEYPAD RE-MAPPING & ERROR HANDLING)
 # ==============================================================================
 class LiveInputDaemon(Thread):
-    def __init__(self, get_current_profile_bindings_callback, app_reference):
+    def __init__(self, get_current_profile_bindings_callback, app_reference, shutdown_event):
         super().__init__()
         self.daemon = True
         self.get_bindings = get_current_profile_bindings_callback
         self.app = app_reference
-        self.running = True
+        self.shutdown_event = shutdown_event
 
     def find_keypad_device(self):
         import evdev
         for path in evdev.list_devices():
             try:
                 dev = evdev.InputDevice(path)
+                if dev.info.vendor != RAZER_VENDOR_ID:
+                    logger.debug(f"Ignored non-Razer input device at {path} (VID: {hex(dev.info.vendor)})")
+                    continue
+                
                 caps = dev.capabilities()
                 if evdev.ecodes.EV_KEY in caps:
                     keys = caps[evdev.ecodes.EV_KEY]
                     if evdev.ecodes.KEY_1 in keys and evdev.ecodes.KEY_EQUAL in keys and "pointer" not in dev.name.lower():
+                        logger.info(f"Identified valid Razer keypad device: {dev.name} at {path}")
                         return dev
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Error inspecting device path {path}: {e}")
+        logger.warning("No compatible Razer keypad device found.")
         return None
 
     def sanitize_action(self, action_str):
@@ -226,8 +249,8 @@ class LiveInputDaemon(Thread):
                     kc = d_xlib.keysym_to_keycode(keysym)
                     if kc:
                         keycodes.append(kc)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to map keysym for {clean_part}: {e}")
         
         if is_press:
             for kc in keycodes:
@@ -244,18 +267,27 @@ class LiveInputDaemon(Thread):
         
         mouse_dev = self.find_keypad_device()
         if not mouse_dev:
+            logger.error("LiveInputDaemon aborted: No valid hardware device available.")
             return
         
         try:
             mouse_dev.grab()
-        except Exception:
-            pass
+            logger.info(f"Successfully obtained exclusive device access for {mouse_dev.name}")
+        except PermissionError:
+            logger.error(f"Permission denied: Cannot obtain exclusive access to {mouse_dev.path}. Ensure your user is in the 'input' or 'plugdev' group.")
+            return
+        except OSError as e:
+            logger.error(f"Device busy or hardware error accessing {mouse_dev.path}: {e}")
+            return
+        except Exception as e:
+            logger.error(f"Unexpected error grabbing input device: {e}")
+            return
 
         d_xlib = None
         try:
             d_xlib = display.Display()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to initialize X11 display connection: {e}")
 
         trinity_map = {
             evdev.ecodes.KEY_1: "1", evdev.ecodes.KEY_2: "2", evdev.ecodes.KEY_3: "3",
@@ -267,7 +299,7 @@ class LiveInputDaemon(Thread):
         }
 
         try:
-            while self.running:
+            while not self.shutdown_event.is_set():
                 r, w, x = select([mouse_dev], [], [], 0.1)
                 if mouse_dev in r:
                     for event in mouse_dev.read():
@@ -294,18 +326,19 @@ class LiveInputDaemon(Thread):
                                 elif event.value == 0:
                                     self.send_combo(d_xlib, target_action, False)
                             continue
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Exception encountered in input event loop: {e}")
         finally:
             try:
                 if d_xlib:
                     d_xlib.close()
                 mouse_dev.ungrab()
-            except:
-                pass
+                logger.info("Released device grab and closed display cleanly.")
+            except Exception as e:
+                logger.debug(f"Error during cleanup: {e}")
 
 # ==============================================================================
-# 4. MAIN GUI APPLICATION (Synapse Layout Standardized, Per-Profile DPI)
+# 4. MAIN GUI APPLICATION & SYNAPSE CONTROL PANEL
 # ==============================================================================
 class NagaSynapseApp(QWidget):
     def __init__(self):
@@ -315,6 +348,8 @@ class NagaSynapseApp(QWidget):
         self.current_active_panel = None
         self.hw_buttons = {}
         self.thumb_buttons = {}
+        
+        self.shutdown_event = threading.Event()
         
         self.profiles = self.load_profiles()
         self.is_mmo_mouse = self.detect_mmo_mouse()
@@ -360,10 +395,11 @@ class NagaSynapseApp(QWidget):
 
         self.bridge = SignalBridge()
         self.bridge.window_changed_signal.connect(self.handle_auto_window_switch)
-        self.switcher = AutoProfileWorker(self.bridge)
+        
+        self.switcher = AutoProfileWorker(self.bridge, self.shutdown_event)
         self.switcher.start()
 
-        self.input_daemon = LiveInputDaemon(self.get_active_bindings, self)
+        self.input_daemon = LiveInputDaemon(self.get_active_bindings, self, self.shutdown_event)
         self.input_daemon.start()
 
         if self.is_mmo_mouse:
@@ -371,22 +407,39 @@ class NagaSynapseApp(QWidget):
         else:
             self.set_panel_view("2-button")
 
+    def closeEvent(self, event):
+        """Ensures background threads and hardware grabs release cleanly on exit."""
+        logger.info("Initiating clean shutdown for OpenChroma...")
+        self.shutdown_event.set()
+        
+        self.switcher.join(timeout=1.0)
+        self.input_daemon.join(timeout=1.0)
+        
+        event.accept()
+
     def detect_mmo_mouse(self):
         m_path = self.find_mouse_sysfs_path()
         if m_path and ("0067" in m_path or "005a" in m_path or "naga" in m_path.lower()):
+            logger.info("Detected MMO mouse via sysfs path.")
             return True
+            
         import evdev
         for path in evdev.list_devices():
             try:
                 dev = evdev.InputDevice(path)
+                if dev.info.vendor != RAZER_VENDOR_ID:
+                    continue
                 caps = dev.capabilities()
                 if evdev.ecodes.EV_KEY in caps:
                     keys = caps[evdev.ecodes.EV_KEY]
                     if evdev.ecodes.KEY_EQUAL in keys and "pointer" not in dev.name.lower():
+                        logger.info(f"Detected MMO mouse via evdev: {dev.name}")
                         return True
-            except Exception:
-                pass
-        return True
+            except Exception as e:
+                logger.debug(f"Error checking device {path} for MMO detection: {e}")
+        
+        logger.warning("No MMO-specific Razer mouse detected; defaulting to standard 2-button layout.")
+        return False
 
     def set_exact_dpi_preset(self, target_dpi, trigger_osd=False):
         self.dpi_slider.blockSignals(True)
@@ -583,6 +636,9 @@ class NagaSynapseApp(QWidget):
         self.setLayout(main_layout)
         self.setFixedSize(980, 600)
 
+    # ==============================================================================
+    # 5. PROFILE & WORKFLOW MANAGEMENT
+    # ==============================================================================
     def get_profile_names(self):
         return list(self.profiles.keys())
 
@@ -643,8 +699,8 @@ class NagaSynapseApp(QWidget):
                     if os.path.exists(name_file):
                         with open(name_file, "r") as f:
                             keyboard_name = f.read().strip()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Could not read keyboard sysfs product name: {e}")
 
         try:
             m_path = self.find_mouse_sysfs_path()
@@ -660,8 +716,8 @@ class NagaSynapseApp(QWidget):
                     if os.path.exists(name_file):
                         with open(name_file, "r") as f:
                             mouse_name = f.read().strip()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Could not read mouse sysfs product name: {e}")
 
         self.detected_hardware_lbl.setText(
             f"<b>Keyboard:</b> {keyboard_name} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Mouse:</b> {mouse_name}"
@@ -676,6 +732,9 @@ class NagaSynapseApp(QWidget):
                 btn.setStyleSheet("QPushButton { background-color: #222222; color: #888888; border: 1px solid #3a3a3a; font-weight: bold; border-radius: 6px; } QPushButton:hover { border: 1px solid #00ff00; color: #ffffff; }")
         self.update_ui_layout(panel_type)
 
+    # ==============================================================================
+    # 6. PERFORMANCE & LIGHTING TABS
+    # ==============================================================================
     def build_performance_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1045,7 +1104,7 @@ class NagaSynapseApp(QWidget):
                 with open(sysfs_path, "wb") as f:
                     f.write(color_bytes)
         except Exception as e:
-            pass
+            logger.debug(f"Failed to apply static color to {target}: {e}")
 
     def on_effect_mode_changed(self, index):
         effect_name = self.effect_combo.currentText()
@@ -1087,8 +1146,8 @@ class NagaSynapseApp(QWidget):
                 if os.path.exists(sysfs_path):
                     with open(sysfs_path, "w") as f:
                         f.write(str(st["brightness"]))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to apply brightness setting: {e}")
 
     def on_breathe_range_changed(self):
         min_val = self.breathe_min_slider.value()
@@ -1137,8 +1196,8 @@ class NagaSynapseApp(QWidget):
                     if os.path.exists(path):
                         with open(path, "w") as f:
                             f.write(val_str)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to update breathe effect step: {e}")
 
     def on_brightness_changed(self, value):
         self.bright_label.setText(f"Brightness: <b>{value}%</b>")
@@ -1156,8 +1215,11 @@ class NagaSynapseApp(QWidget):
                 with open(sysfs_path, "w") as f:
                     f.write(str(value))
         except Exception as e:
-            pass
+            logger.debug(f"Failed to set brightness: {e}")
 
+    # ==============================================================================
+    # 7. UI LAYOUT BUILDERS & EVENT HANDLERS
+    # ==============================================================================
     def handle_mouse_function_selection(self, index):
         if index > 0:
             selected_func = self.mouse_func_combo.currentText()
@@ -1436,6 +1498,9 @@ class NagaSynapseApp(QWidget):
         else:
             self.record_btn.setText("Record Keyboard Function")
 
+    # ==============================================================================
+    # 8. CONFIGURATION STORAGE & FILE I/O
+    # ==============================================================================
     def load_profiles(self):
         default_blueprints = {
             "Default Profile": {"bindings": {}, "dpi": 1800, "aliases": ["default"]}, 
@@ -1457,8 +1522,8 @@ class NagaSynapseApp(QWidget):
                             elif "aliases" not in data[k]:
                                 data[k]["aliases"] = [base + ".exe", base]
                     return data
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Failed to load profiles from disk: {e}")
         return default_blueprints
 
     def save_to_disk(self):
@@ -1559,6 +1624,9 @@ class NagaSynapseApp(QWidget):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to import profiles: {e}")
 
+# ==============================================================================
+# 9. APPLICATION ENTRY/EXIT POINT
+# ==============================================================================
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     ex = NagaSynapseApp()
