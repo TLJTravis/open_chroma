@@ -1504,7 +1504,7 @@ class NagaSynapseApp(QWidget):
     def load_profiles(self):
         default_blueprints = {
             "Default Profile": {"bindings": {}, "dpi": 1800, "aliases": ["default"]}, 
-            "ffxiv": {"bindings": {"1": "Ctrl+1"}, "dpi": 3600, "aliases": ["ffxivgame.x64", "ffxiv"]}, 
+            "ffxiv": {"bindings": {"1": "Ctrl+1"}, "dpi": 3600, "aliases": ["ffxivgame.x64", "ffxiv.exe", "ffxiv", "final fantasy xiv", "final fantasy 14"]}, 
             "PSO2 NGS": {"bindings": {"1": "X", "2": "Shift", "3": "Middle Click"}, "dpi": 4800, "aliases": ["pso2.exe", "pso2_bin/pso2.exe", "phantasy star online 2 new genesis", "new genesis"]}
         }
         if os.path.exists(PROFILE_FILE):
@@ -1519,8 +1519,10 @@ class NagaSynapseApp(QWidget):
                             base = k.lower().replace(" ", "")
                             if "pso2" in base:
                                 data[k]["aliases"] = ["pso2.exe", "pso2_bin/pso2.exe", "phantasy star online 2 new genesis", "new genesis"]
+                            elif "ffxiv" in base or "finalfantasy" in base:
+                                data[k]["aliases"] = ["ffxivgame.x64", "ffxiv.exe", "ffxiv", "final fantasy xiv", "final fantasy 14"]
                             elif "aliases" not in data[k]:
-                                data[k]["aliases"] = [base + ".exe", base]
+                                data[k]["aliases"] = [base + ".exe", base, k.lower()]
                     return data
             except Exception as e:
                 logger.error(f"Failed to load profiles from disk: {e}")
@@ -1531,12 +1533,13 @@ class NagaSynapseApp(QWidget):
         
         for profile_name, profile_data in self.profiles.items():
             if isinstance(profile_data, dict):
-                if "aliases" not in profile_data:
-                    base = profile_name.lower().replace(" ", "")
-                    if "pso2" in base:
-                        profile_data["aliases"] = ["pso2.exe", "pso2_bin/pso2.exe", "phantasy star online 2 new genesis", "new genesis"]
-                    else:
-                        profile_data["aliases"] = [base + ".exe", base]
+                base = profile_name.lower().replace(" ", "")
+                if "pso2" in base:
+                    profile_data["aliases"] = ["pso2.exe", "pso2_bin/pso2.exe", "phantasy star online 2 new genesis", "new genesis"]
+                elif "ffxiv" in base or "finalfantasy" in base:
+                    profile_data["aliases"] = ["ffxivgame.x64", "ffxiv.exe", "ffxiv", "final fantasy xiv", "final fantasy 14"]
+                elif "aliases" not in profile_data:
+                    profile_data["aliases"] = [base + ".exe", base, profile_name.lower()]
 
         os.makedirs(os.path.dirname(PROFILE_FILE), exist_ok=True)
         with open(PROFILE_FILE, 'w') as f:
