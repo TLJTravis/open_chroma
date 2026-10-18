@@ -2,6 +2,8 @@
 
 OpenChroma is a lightweight, universal control utility designed for Linux. It provides per-profile key remapping, automated window profile switching, and customizable Chroma lighting management for Razer peripherals (such as the Razer Naga Trinity and Ornata V2) on Linux distributions like Linux Mint.
 
+## Acknowledgments
+- This project utilizes code and concepts from [OpenRazer](https://github.com/openrazer/openrazer) for device communication and driver management.
 ---
 
 ## Features
