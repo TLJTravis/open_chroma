@@ -6,6 +6,10 @@ OpenChroma is a lightweight, universal control utility designed for Linux. It pr
 - This project utilizes code and concepts from [OpenRazer](https://github.com/openrazer/openrazer) for device communication and driver management.
 ---
 
+## Testing Environment
+This program is being developed on Linux Mint Cinnamon with the X11 system running underneath. I understand from feedback that the xdotool isn't working properly with Wayland. Please feel free to give feedback and I'll do my best to progress the development to work with more desktop environments!
+---
+
 ## Features
 
 - **Automated Profile Switching:** Automatically detects active game windows (configured for FFXIV, PSO2 NGS, and more) and swaps keybind/DPI profiles using `xdotool`.
