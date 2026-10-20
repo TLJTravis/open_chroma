@@ -7,7 +7,7 @@ OpenChroma is a lightweight, universal control utility designed for Linux. It pr
 ---
 
 ## Testing Environment
-This program is being developed on Linux Mint Cinnamon with the X11 system running underneath. I understand from feedback that the xdotool isn't working properly with Wayland. Please feel free to give feedback and I'll do my best to progress the development to work with more desktop environments!
+This program is being developed on Linux Mint Cinnamon with the X11 system running underneath. Wayland is still too new and is experimental on Linux Mint. For now, at least, this program is not going to be developed for Wayland.
 ---
 
 ## Features

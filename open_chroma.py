@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
 # ==============================================================================
-# OPENCHROMA - UNIVERSAL PERIPHERAL CONTROL UTILITY FOR LINUX
+# OPENCHROMA - UNIVERSAL PERIPHERAL CONTROL UTILITY FOR LINUX (X11 ONLY)
 # Author: TLJTravis
 # Description: Per-profile key remapping, automated window switching, and Chroma lighting.
+# Supports X11 display environments via Xlib and xdotool.
 # ==============================================================================
 
 import sys, json, os, glob, subprocess, logging, threading
@@ -26,10 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("OpenChroma")
 
-# Path where customized key and profile settings are stored on Linux Mint
 PROFILE_FILE = os.path.expanduser("~/.config/naga_profiles.json")
-
-# Razer USB Vendor ID constant for strict hardware validation
 RAZER_VENDOR_ID = 0x1532
 
 # ==============================================================================
@@ -158,7 +156,6 @@ class AutoProfileWorker(Thread):
             name_res = subprocess.run(["xdotool", "getwindowname", win_id], capture_output=True, text=True)
             name_str = name_res.stdout.strip().lower() if name_res.returncode == 0 else ""
 
-            # Fetch WM_CLASS via xprop for Proton games (e.g. steam_app_5280930)
             xprop_res = subprocess.run(["xprop", "-id", win_id, "WM_CLASS"], capture_output=True, text=True)
             if xprop_res.returncode == 0:
                 for part in xprop_res.stdout.lower().split("="):
@@ -184,7 +181,7 @@ class AutoProfileWorker(Thread):
                 break
 
 # ==============================================================================
-# 3. LIVE INPUT DAEMON (SIDE-KEYPAD RE-MAPPING & ERROR HANDLING)
+# 3. LIVE INPUT DAEMON (X11 XLIb RE-MAPPING)
 # ==============================================================================
 class LiveInputDaemon(Thread):
     def __init__(self, get_current_profile_bindings_callback, app_reference, shutdown_event):
@@ -197,7 +194,6 @@ class LiveInputDaemon(Thread):
     def find_keypad_device(self):
         import evdev
 
-        # 1. First priority: Check /dev/input/event9 directly if it exists and has key capabilities
         if os.path.exists("/dev/input/event9"):
             try:
                 dev = evdev.InputDevice("/dev/input/event9")
@@ -208,7 +204,6 @@ class LiveInputDaemon(Thread):
             except Exception as e:
                 logger.debug(f"Error checking /dev/input/event9: {e}")
 
-        # 2. Dynamic Fallback: Search all event nodes for Razer devices exposing codes 2-13
         for path in evdev.list_devices():
             try:
                 dev = evdev.InputDevice(path)
@@ -218,7 +213,6 @@ class LiveInputDaemon(Thread):
                 caps = dev.capabilities()
                 if evdev.ecodes.EV_KEY in caps:
                     keys = caps[evdev.ecodes.EV_KEY]
-                    # Check if node supports side plate scancodes 2 through 13
                     if all(k in keys for k in range(2, 10)):
                         logger.info(f"Dynamically discovered Razer keypad matrix: {dev.name} at {path}")
                         return dev
@@ -242,8 +236,17 @@ class LiveInputDaemon(Thread):
         return action_str
 
     def send_combo(self, d_xlib, action_str, is_press):
+        if "Click" in action_str:
+            click_map = {
+                "Left Click": "1",
+                "Right Click": "3",
+                "Middle Click": "2"
+            }
+            if action_str in click_map and is_press:
+                subprocess.run(["xdotool", "click", click_map[action_str]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+
         parts = action_str.split("+")
-        
         is_only_modifiers = all(p.lower() in ["ctrl", "control", "shift", "alt"] for p in parts)
         
         if is_only_modifiers:
@@ -311,11 +314,12 @@ class LiveInputDaemon(Thread):
             logger.error(f"Unexpected error grabbing input device: {e}")
             return
 
-        d_xlib = None
         try:
             d_xlib = display.Display()
+            logger.info("Initialized Xlib display connection for X11 session.")
         except Exception as e:
             logger.error(f"Failed to initialize X11 display connection: {e}")
+            return
 
         trinity_map = {
             2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 7: "6",
@@ -326,13 +330,16 @@ class LiveInputDaemon(Thread):
             evdev.ecodes.REL_HWHEEL: "Scroll_Tilt"
         }
 
+        hardware_button_map = {
+            2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 7: "6",
+            8: "7", 9: "8", 10: "9", 11: "10", 12: "11", 13: "12"
+        }
+
         try:
             while not self.shutdown_event.is_set():
                 r, w, x = select([mouse_dev.fileno()], [], [], 0.1)
                 if mouse_dev.fileno() in r:
                     for event in mouse_dev.read():
- #                       print(f"RAW EVENT -> type: {event.type}, code: {event.code}, val: {event.value}")
-                    
                         bindings = self.get_bindings()
                         
                         if event.type == evdev.ecodes.EV_REL and event.code == evdev.ecodes.REL_HWHEEL:
@@ -344,7 +351,11 @@ class LiveInputDaemon(Thread):
                         if event.type != evdev.ecodes.EV_KEY:
                             continue
                         
-                        button_str = trinity_map.get(event.code)
+                        if event.code in hardware_button_map:
+                            button_str = hardware_button_map[event.code]
+                        else:
+                            button_str = trinity_map.get(event.code)
+
                         if event.code == 3:
                             button_str = "2"
 
@@ -363,7 +374,7 @@ class LiveInputDaemon(Thread):
                 if d_xlib:
                     d_xlib.close()
                 mouse_dev.ungrab()
-                logger.info("Released device grab and closed display cleanly.")
+                logger.info("Released device grab and closed Xlib backend cleanly.")
             except Exception as e:
                 logger.debug(f"Error during cleanup: {e}")
 
@@ -438,7 +449,6 @@ class NagaSynapseApp(QWidget):
             self.set_panel_view("2-button")
 
     def closeEvent(self, event):
-        """Ensures background threads and hardware grabs release cleanly on exit."""
         logger.info("Initiating clean shutdown for OpenChroma...")
         self.shutdown_event.set()
         
@@ -495,7 +505,7 @@ class NagaSynapseApp(QWidget):
         self.set_exact_dpi_preset(closest_dpi, trigger_osd=False)
 
     def initUI(self):
-        self.setWindowTitle('OpenChroma Controls (Universal)')
+        self.setWindowTitle('OpenChroma Controls (Universal X11)')
         
         icon_path = os.path.join(os.path.dirname(__file__), "assets", "openchroma.jpeg")
         if os.path.exists(icon_path):
@@ -666,9 +676,6 @@ class NagaSynapseApp(QWidget):
         self.setLayout(main_layout)
         self.setFixedSize(980, 600)
 
-    # ==============================================================================
-    # 5. PROFILE & WORKFLOW MANAGEMENT
-    # ==============================================================================
     def get_profile_names(self):
         return list(self.profiles.keys())
 
@@ -691,7 +698,6 @@ class NagaSynapseApp(QWidget):
             self.change_profile(0)
 
     def register_active_alias(self, profile_name, new_identifier):
-        """Appends a newly discovered window class or title to a profile's aliases and saves to JSON."""
         if not new_identifier or profile_name not in self.profiles:
             return False
 
@@ -711,7 +717,6 @@ class NagaSynapseApp(QWidget):
         return False
 
     def save_profiles_to_disk_silent(self):
-        """Helper to save profiles quietly without showing a popup box."""
         try:
             os.makedirs(os.path.dirname(PROFILE_FILE), exist_ok=True)
             with open(PROFILE_FILE, 'w') as f:
@@ -813,9 +818,6 @@ class NagaSynapseApp(QWidget):
                 btn.setStyleSheet("QPushButton { background-color: #222222; color: #888888; border: 1px solid #3a3a3a; font-weight: bold; border-radius: 6px; } QPushButton:hover { border: 1px solid #00ff00; color: #ffffff; }")
         self.update_ui_layout(panel_type)
 
-    # ==============================================================================
-    # 6. PERFORMANCE & LIGHTING TABS
-    # ==============================================================================
     def build_performance_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1298,9 +1300,6 @@ class NagaSynapseApp(QWidget):
         except Exception as e:
             logger.debug(f"Failed to set brightness: {e}")
 
-    # ==============================================================================
-    # 7. UI LAYOUT BUILDERS & EVENT HANDLERS
-    # ==============================================================================
     def handle_mouse_function_selection(self, index):
         if index > 0:
             selected_func = self.mouse_func_combo.currentText()
@@ -1462,9 +1461,12 @@ class NagaSynapseApp(QWidget):
     def get_active_bindings(self):
         curr_prof = self.get_active_profile_name()
         prof_data = self.profiles.get(curr_prof, {})
-        if isinstance(prof_data, dict) and "bindings" in prof_data:
-            return prof_data["bindings"]
-        return prof_data
+        
+        if isinstance(prof_data, dict):
+            if "bindings" in prof_data:
+                return prof_data["bindings"]
+            return prof_data
+        return {}
 
     def update_button_visuals(self):
         current_bindings = self.get_active_bindings()
@@ -1579,14 +1581,11 @@ class NagaSynapseApp(QWidget):
         else:
             self.record_btn.setText("Record Keyboard Function")
 
-    # ==============================================================================
-    # 8. CONFIGURATION STORAGE & FILE I/O
-    # ==============================================================================
     def load_profiles(self):
         default_blueprints = {
             "Default Profile": {"bindings": {}, "dpi": 1800, "aliases": ["default"]}, 
             "ffxiv": {"bindings": {"1": "Ctrl+1"}, "dpi": 3600, "aliases": ["ffxivgame.x64", "ffxiv.exe", "ffxiv", "final fantasy xiv", "final fantasy 14"]}, 
-            "PSO2 NGS": {"bindings": {"1": "X", "2": "Shift", "3": "Middle Click"}, "dpi": 4800, "aliases": ["pso2.exe", "pso2_bin/pso2.exe", "phantasy star online 2 new genesis", "new genesis"]}
+            "PSO2 NGS": {"bindings": {"1": "X", "2": "Shift", "3": "Middle Click", "4": "4", "5": "5", "6": "6", "7": "7", "8": "8", "9": "9", "10": "0", "11": "-", "12": "="}, "dpi": 4800, "aliases": ["pso2.exe", "pso2_bin/pso2.exe", "phantasy star online 2 new genesis", "new genesis"]}
         }
         if os.path.exists(PROFILE_FILE):
             try:
@@ -1708,9 +1707,6 @@ class NagaSynapseApp(QWidget):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to import profiles: {e}")
 
-# ==============================================================================
-# 9. APPLICATION ENTRY/EXIT POINT
-# ==============================================================================
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     ex = NagaSynapseApp()
