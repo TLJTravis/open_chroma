@@ -147,24 +147,38 @@ class AutoProfileWorker(Thread):
 
     def get_active_window_info(self):
         try:
-            class_res = subprocess.run(["xdotool", "getactivewindow", "getwindowclassname"], capture_output=True, text=True)
+            win_id_res = subprocess.run(["xdotool", "getactivewindow"], capture_output=True, text=True)
+            if win_id_res.returncode != 0 or not win_id_res.stdout.strip():
+                return "", [], ""
+            win_id = win_id_res.stdout.strip()
+
+            class_res = subprocess.run(["xdotool", "getwindowclassname", win_id], capture_output=True, text=True)
             class_tokens = [class_res.stdout.strip().lower()] if class_res.returncode == 0 and class_res.stdout.strip() else []
             
-            name_res = subprocess.run(["xdotool", "getactivewindow", "getwindowname"], capture_output=True, text=True)
+            name_res = subprocess.run(["xdotool", "getwindowname", win_id], capture_output=True, text=True)
             name_str = name_res.stdout.strip().lower() if name_res.returncode == 0 else ""
+
+            # Fetch WM_CLASS via xprop for Proton games (e.g. steam_app_5280930)
+            xprop_res = subprocess.run(["xprop", "-id", win_id, "WM_CLASS"], capture_output=True, text=True)
+            if xprop_res.returncode == 0:
+                for part in xprop_res.stdout.lower().split("="):
+                    for token in part.split(","):
+                        clean_token = token.replace('"', '').strip()
+                        if clean_token and clean_token not in class_tokens:
+                            class_tokens.append(clean_token)
             
-            return class_tokens, name_str
+            return win_id, class_tokens, name_str
         except Exception as e:
-            logger.debug(f"Failed to query active window via xdotool: {e}")
-            return [], ""
+            logger.debug(f"Failed to query active window via xdotool/xprop: {e}")
+            return "", [], ""
 
     def run(self):
         while not self.shutdown_event.is_set():
-            class_tokens, window_title = self.get_active_window_info()
-            combined_key = (tuple(class_tokens), window_title)
+            win_id, class_tokens, window_title = self.get_active_window_info()
+            combined_key = (win_id, tuple(class_tokens), window_title)
             if combined_key != self.last_seen_window:
                 self.last_seen_window = combined_key
-                self.emitter.window_changed_signal.emit((class_tokens, window_title))
+                self.emitter.window_changed_signal.emit((win_id, class_tokens, window_title))
             
             if self.shutdown_event.wait(1.5):
                 break
@@ -182,22 +196,36 @@ class LiveInputDaemon(Thread):
 
     def find_keypad_device(self):
         import evdev
+
+        # 1. First priority: Check /dev/input/event9 directly if it exists and has key capabilities
+        if os.path.exists("/dev/input/event9"):
+            try:
+                dev = evdev.InputDevice("/dev/input/event9")
+                caps = dev.capabilities()
+                if evdev.ecodes.EV_KEY in caps:
+                    logger.info(f"Successfully bound Naga side-plate device at /dev/input/event9")
+                    return dev
+            except Exception as e:
+                logger.debug(f"Error checking /dev/input/event9: {e}")
+
+        # 2. Dynamic Fallback: Search all event nodes for Razer devices exposing codes 2-13
         for path in evdev.list_devices():
             try:
                 dev = evdev.InputDevice(path)
                 if dev.info.vendor != RAZER_VENDOR_ID:
-                    logger.debug(f"Ignored non-Razer input device at {path} (VID: {hex(dev.info.vendor)})")
                     continue
-                
+
                 caps = dev.capabilities()
                 if evdev.ecodes.EV_KEY in caps:
                     keys = caps[evdev.ecodes.EV_KEY]
-                    if evdev.ecodes.KEY_1 in keys and evdev.ecodes.KEY_EQUAL in keys and "pointer" not in dev.name.lower():
-                        logger.info(f"Identified valid Razer keypad device: {dev.name} at {path}")
+                    # Check if node supports side plate scancodes 2 through 13
+                    if all(k in keys for k in range(2, 10)):
+                        logger.info(f"Dynamically discovered Razer keypad matrix: {dev.name} at {path}")
                         return dev
             except Exception as e:
-                logger.debug(f"Error inspecting device path {path}: {e}")
-        logger.warning("No compatible Razer keypad device found.")
+                logger.debug(f"Error inspecting device node {path}: {e}")
+
+        logger.warning("No compatible Razer Naga side-plate device detected.")
         return None
 
     def sanitize_action(self, action_str):
@@ -290,19 +318,21 @@ class LiveInputDaemon(Thread):
             logger.error(f"Failed to initialize X11 display connection: {e}")
 
         trinity_map = {
-            evdev.ecodes.KEY_1: "1", evdev.ecodes.KEY_2: "2", evdev.ecodes.KEY_3: "3",
-            evdev.ecodes.KEY_4: "4", evdev.ecodes.KEY_5: "5", evdev.ecodes.KEY_6: "6",
-            evdev.ecodes.KEY_7: "7", evdev.ecodes.KEY_8: "8", evdev.ecodes.KEY_9: "9",
-            evdev.ecodes.KEY_0: "10", evdev.ecodes.KEY_MINUS: "11", evdev.ecodes.KEY_EQUAL: "12",
-            evdev.ecodes.BTN_MIDDLE: "Top_M", evdev.ecodes.BTN_FORWARD: "Top_Forward", evdev.ecodes.BTN_BACK: "Top_Back",
+            2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 7: "6",
+            8: "7", 9: "8", 10: "9", 11: "10", 12: "11", 13: "12",
+            evdev.ecodes.BTN_MIDDLE: "Top_M", 
+            evdev.ecodes.BTN_FORWARD: "Top_Forward", 
+            evdev.ecodes.BTN_BACK: "Top_Back",
             evdev.ecodes.REL_HWHEEL: "Scroll_Tilt"
         }
 
         try:
             while not self.shutdown_event.is_set():
-                r, w, x = select([mouse_dev], [], [], 0.1)
-                if mouse_dev in r:
+                r, w, x = select([mouse_dev.fileno()], [], [], 0.1)
+                if mouse_dev.fileno() in r:
                     for event in mouse_dev.read():
+ #                       print(f"RAW EVENT -> type: {event.type}, code: {event.code}, val: {event.value}")
+                    
                         bindings = self.get_bindings()
                         
                         if event.type == evdev.ecodes.EV_REL and event.code == evdev.ecodes.REL_HWHEEL:
@@ -315,8 +345,8 @@ class LiveInputDaemon(Thread):
                             continue
                         
                         button_str = trinity_map.get(event.code)
-                        if event.code == evdev.ecodes.KEY_3:
-                            button_str = "3"
+                        if event.code == 3:
+                            button_str = "2"
 
                         if button_str and button_str in bindings:
                             target_action = bindings[button_str]
@@ -660,8 +690,40 @@ class NagaSynapseApp(QWidget):
             self.sync_all_profile_dropdowns(prof_name)
             self.change_profile(0)
 
+    def register_active_alias(self, profile_name, new_identifier):
+        """Appends a newly discovered window class or title to a profile's aliases and saves to JSON."""
+        if not new_identifier or profile_name not in self.profiles:
+            return False
+
+        profile_data = self.profiles[profile_name]
+        if not isinstance(profile_data, dict):
+            return False
+
+        aliases = profile_data.setdefault("aliases", [])
+        normalized_aliases = [a.lower().strip() for a in aliases]
+        clean_id = new_identifier.lower().strip()
+
+        if clean_id not in normalized_aliases:
+            aliases.append(clean_id)
+            self.save_profiles_to_disk_silent()
+            logger.info(f"Auto-registered new alias '{clean_id}' for profile '{profile_name}'")
+            return True
+        return False
+
+    def save_profiles_to_disk_silent(self):
+        """Helper to save profiles quietly without showing a popup box."""
+        try:
+            os.makedirs(os.path.dirname(PROFILE_FILE), exist_ok=True)
+            with open(PROFILE_FILE, 'w') as f:
+                json.dump(self.profiles, f, indent=4)
+        except Exception as e:
+            logger.error(f"Failed to save profiles quietly: {e}")
+
     def handle_auto_window_switch(self, window_info):
-        class_tokens, window_title = window_info
+        win_id, class_tokens, window_title = window_info
+        matched_profile = None
+        matched_token = None
+
         for p in self.profiles.keys():
             p_lower = p.lower()
             prof_data = self.profiles[p]
@@ -669,17 +731,36 @@ class NagaSynapseApp(QWidget):
             if not aliases:
                 aliases = [p_lower.replace(" ", "") + ".exe", p_lower]
             
-            match_found = any(any(alias.lower() in token for token in class_tokens) for alias in aliases) or any(alias.lower() in window_title for alias in aliases)
+            match_found = any(any(alias.lower() in token for token in class_tokens) for alias in aliases) or \
+                          any(alias.lower() in window_title for alias in aliases)
             
             if not match_found and "pso2" in p_lower and ("pso2" in window_title or any("pso2" in t for t in class_tokens)):
                 match_found = True
 
             if match_found:
-                current_selected = self.get_active_profile_name()
-                if current_selected != p:
-                    self.sync_all_profile_dropdowns(p)
-                    self.change_profile(0)
+                matched_profile = p
                 break
+
+        if not matched_profile:
+            for token in class_tokens:
+                if token.startswith("steam_app_"):
+                    current_selected = self.get_active_profile_name()
+                    if current_selected != "Default Profile":
+                        matched_profile = current_selected
+                        matched_token = token
+                        break
+
+        if matched_profile:
+            current_selected = self.get_active_profile_name()
+            if current_selected != matched_profile:
+                self.sync_all_profile_dropdowns(matched_profile)
+                self.change_profile(0)
+            
+            if matched_token:
+                self.register_active_alias(matched_profile, matched_token)
+            elif window_title and len(window_title) > 3:
+                if matched_profile != "Default Profile":
+                    self.register_active_alias(matched_profile, window_title)
 
     def update_detected_hardware_labels(self):
         keyboard_name = "Razer Ornata V2"

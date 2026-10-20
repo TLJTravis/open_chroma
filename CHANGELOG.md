@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## Medium Code Fixes and Syntax Corrections - 10/19/2026
+
+### Fixed
+* **Hardware Event Node Binding:** Resolved issue where device detection selected generic mouse pointer endpoints by prioritizing `/dev/input/event9` with dynamic capability verification fallback.
+* **Keycode Offset Correction:** Switched from `evdev.ecodes` constants to raw integer keycode mapping (`2`–`13`) in `trinity_map` to accurately align with Naga Trinity side-plate matrix events.
+* **Macro Processor Crash:** Restored missing `sanitize_action` method in `LiveInputDaemon` to eliminate `AttributeError` exceptions when parsing key combinations and modifier sequences.
+
+### Changed
+* **Terminal Output Optimization:** Commented out verbose raw `evdev` event debug printing in the primary input loop for clean production logging.
+
+---
+
 ## [1.0.1] - Minor bug Fixes and Window Switching 10/18/2026
 ### Added
 A quick summary of what we completed today:
