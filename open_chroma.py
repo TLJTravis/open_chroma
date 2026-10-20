@@ -12,9 +12,10 @@ from threading import Thread
 from PyQt6.QtWidgets import (QApplication, QWidget, QGridLayout, QPushButton,
                              QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                              QComboBox, QButtonGroup, QMessageBox, QFileDialog, 
-                             QTabWidget, QFrame, QSlider, QInputDialog)
+                             QTabWidget, QFrame, QSlider, QInputDialog,
+                             QSystemTrayIcon, QMenu, QCheckBox, QStyle)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint, QRectF
-from PyQt6.QtGui import QColor, QPainter, QLinearGradient, QMouseEvent, QPen, QFont, QIcon
+from PyQt6.QtGui import QColor, QPainter, QLinearGradient, QMouseEvent, QPen, QFont, QIcon, QAction, QPixmap
 from Xlib import X, display, XK
 from Xlib.ext import xtest
 
@@ -389,6 +390,7 @@ class NagaSynapseApp(QWidget):
         self.current_active_panel = None
         self.hw_buttons = {}
         self.thumb_buttons = {}
+        self.saved_geometry = None
         
         self.shutdown_event = threading.Event()
         
@@ -448,6 +450,11 @@ class NagaSynapseApp(QWidget):
         else:
             self.set_panel_view("2-button")
 
+    def changeEvent(self, event):
+        if self.isMinimized() or not self.isVisible():
+            self.saved_geometry = self.geometry()
+        super().changeEvent(event)
+
     def closeEvent(self, event):
         logger.info("Initiating clean shutdown for OpenChroma...")
         self.shutdown_event.set()
@@ -505,9 +512,10 @@ class NagaSynapseApp(QWidget):
         self.set_exact_dpi_preset(closest_dpi, trigger_osd=False)
 
     def initUI(self):
-        self.setWindowTitle('OpenChroma Controls (Universal X11)')
+        self.setWindowTitle('OpenChroma Controls (Universal X11 - 1.0.3)')
         
-        icon_path = os.path.join(os.path.dirname(__file__), "assets", "openchroma.jpeg")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(script_dir, "assets", "OpenChroma.png")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
@@ -673,8 +681,119 @@ class NagaSynapseApp(QWidget):
         self.tabs.addTab(light_tab, "LIGHTING")
 
         main_layout.addWidget(self.tabs)
+
+        # --- Bottom Right Footer Layout ---
+        footer_layout = QHBoxLayout()
+        footer_layout.setContentsMargins(15, 0, 15, 8)
+        footer_layout.addStretch()
+        
+        self.autostart_chk = QCheckBox("Open program on startup")
+        self.autostart_chk.setChecked(self.check_autostart_status())
+        self.autostart_chk.setStyleSheet("""
+            QCheckBox {
+                color: #00FF66;
+                spacing: 5px;
+            }
+            QCheckBox::indicator {
+                border: 1px solid #00FF66;
+                background: #1e1e1e;
+                width: 14px;
+                height: 14px;
+            }
+            QCheckBox::indicator:checked {
+                background: #00FF66;
+            }
+        """)
+        self.autostart_chk.stateChanged.connect(self.toggle_autostart)
+        footer_layout.addWidget(self.autostart_chk)
+        
+        main_layout.addLayout(footer_layout)
+
         self.setLayout(main_layout)
         self.setFixedSize(980, 600)
+
+        # --- System Tray Initialization ---
+        self.tray_icon = QSystemTrayIcon(self)
+        if os.path.exists(icon_path):
+            pixmap = QPixmap(icon_path)
+            custom_icon = QIcon(pixmap)
+            self.tray_icon.setIcon(custom_icon)
+            self.setWindowIcon(custom_icon)
+        else:
+            self.tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        
+        self.tray_menu = QMenu()
+        
+        self.show_action = QAction("Show OpenChroma", self)
+        self.show_action.triggered.connect(self.showNormal)
+        self.tray_menu.addAction(self.show_action)
+        
+        self.tray_menu.addSeparator()
+        
+        self.tray_profile_menu = self.tray_menu.addMenu("Switch Game Profile")
+        self.update_tray_profile_menu()
+        
+        self.tray_menu.addSeparator()
+        
+        self.quit_action = QAction("Quit Program", self)
+        self.quit_action.triggered.connect(QApplication.instance().quit)
+        self.tray_menu.addAction(self.quit_action)
+        
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self.handle_tray_activation)
+        self.tray_icon.show()
+
+    def update_tray_profile_menu(self):
+        if not hasattr(self, 'tray_profile_menu'):
+            return
+        self.tray_profile_menu.clear()
+        for prof_name in self.get_profile_names():
+            action = QAction(prof_name, self)
+            action.triggered.connect(lambda checked, p=prof_name: self.select_profile_from_tray(p))
+            self.tray_profile_menu.addAction(action)
+
+    def select_profile_from_tray(self, profile_name):
+        self.sync_all_profile_dropdowns(profile_name)
+        self.change_profile(0)
+        logger.info(f"Switched profile to '{profile_name}' via system tray.")
+
+    def handle_tray_activation(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            if self.isVisible():
+                self.saved_geometry = self.geometry()
+                self.hide()
+            else:
+                self.showNormal()
+                if self.saved_geometry is not None:
+                    self.setGeometry(self.saved_geometry)
+                self.activateWindow()
+
+    def get_autostart_path(self):
+        return os.path.expanduser("~/.config/autostart/openchroma.desktop")
+
+    def check_autostart_status(self):
+        return os.path.exists(self.get_autostart_path())
+
+    def toggle_autostart(self, state):
+        desktop_path = self.get_autostart_path()
+        if state == 2:
+            os.makedirs(os.path.dirname(desktop_path), exist_ok=True)
+            script_path = os.path.abspath(__file__)
+            desktop_content = f"""[Desktop Entry]
+Type=Application
+Name=OpenChroma
+Exec=python3 {script_path}
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+"""
+            with open(desktop_path, "w") as f:
+                f.write(desktop_content)
+            logger.info("Created autostart configuration.")
+        else:
+            if os.path.exists(desktop_path):
+                os.remove(desktop_path)
+                logger.info("Removed autostart configuration.")
 
     def get_profile_names(self):
         return list(self.profiles.keys())
@@ -689,6 +808,7 @@ class NagaSynapseApp(QWidget):
             combo.blockSignals(True)
             combo.setCurrentText(profile_name)
             combo.blockSignals(False)
+        self.update_tray_profile_menu()
 
     def handle_dropdown_profile_change(self, index):
         sender_combo = self.sender()
@@ -1625,6 +1745,7 @@ class NagaSynapseApp(QWidget):
         with open(PROFILE_FILE, 'w') as f:
             json.dump(self.profiles, f, indent=4)
         self.update_button_visuals()
+        self.update_tray_profile_menu()
         QMessageBox.information(self, "Success", "Layout profiles and DPI settings successfully updated.")
         
     def change_profile(self, index):
@@ -1658,22 +1779,50 @@ class NagaSynapseApp(QWidget):
                 combo.setCurrentText(new_name)
                 combo.blockSignals(False)
             
+            self.update_tray_profile_menu()
             self.change_profile(0)
 
+    def remove_profile_file(self, profile_name):
+        profile_path = os.path.expanduser(f"~/.config/openchroma/{profile_name}.json")
+        if os.path.exists(profile_path):
+            os.remove(profile_path)
+            logger.info(f"Removed profile file: {profile_path}")
+
     def delete_profile(self):
-        cp = self.get_active_profile_name()
-        if cp == "Default Profile": return
-        del self.profiles[cp]
-        
-        for combo in self.profile_dropdowns:
-            combo.blockSignals(True)
-            idx = combo.findText(cp)
-            if idx >= 0:
-                combo.removeItem(idx)
-            combo.blockSignals(False)
-            
-        self.change_profile(0)
-        self.save_to_disk()
+        current_prof = self.get_active_profile_name()
+        if not current_prof or current_prof == "Default Profile":
+            QMessageBox.warning(self, "Warning", "Cannot delete the Default Profile or an empty selection.")
+            return
+
+        reply = QMessageBox.question(
+            self, 
+            "Confirm Deletion", 
+            f"Are you sure you want to delete profile '{current_prof}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                if current_prof in self.profiles:
+                    del self.profiles[current_prof]
+                
+                self.remove_profile_file(current_prof)
+                
+                for combo in self.profile_dropdowns:
+                    combo.blockSignals(True)
+                    combo.clear()
+                    combo.addItems(self.get_profile_names())
+                    combo.blockSignals(False)
+                
+                self.update_tray_profile_menu()
+                self.change_profile(0)
+                self.save_to_disk()
+                
+                QMessageBox.information(self, "Success", f"Profile '{current_prof}' was successfully deleted.")
+            except Exception as e:
+                logger.error(f"Failed to delete profile: {e}")
+                QMessageBox.critical(self, "Error", f"Could not delete profile: {e}")
 
     def export_profiles(self):
         file_path, _ = QFileDialog.getSaveFileName(self, "Export Profiles", os.path.expanduser("~/naga_profiles_backup.json"), "JSON Files (*.json)")
@@ -1699,6 +1848,7 @@ class NagaSynapseApp(QWidget):
                         combo.clear()
                         combo.addItems(self.get_profile_names())
                         combo.blockSignals(False)
+                    self.update_tray_profile_menu()
                     self.change_profile(0)
                     self.save_to_disk()
                     QMessageBox.information(self, "Success", "Profiles successfully imported and applied!")
