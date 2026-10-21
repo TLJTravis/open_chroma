@@ -385,6 +385,9 @@ class LiveInputDaemon(Thread):
 class NagaSynapseApp(QWidget):
     def __init__(self):
         super().__init__()
+        self.setProperty("class", "openchroma")
+        self.setWindowRole("openchroma")
+        
         self.active_button_name, self.is_recording = None, False
         self.current_combo = set()
         self.current_active_panel = None
@@ -449,6 +452,13 @@ class NagaSynapseApp(QWidget):
             self.set_panel_view("12-button")
         else:
             self.set_panel_view("2-button")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(script_dir, "assets", "OpenChroma.png")
+        if os.path.exists(icon_path) and self.windowHandle():
+            self.windowHandle().setIcon(QIcon(icon_path))
 
     def changeEvent(self, event):
         if self.isMinimized() or not self.isVisible():
@@ -1858,7 +1868,15 @@ X-GNOME-Autostart-enabled=true
                 QMessageBox.critical(self, "Error", f"Failed to import profiles: {e}")
 
 if __name__ == '__main__':
+    QApplication.setDesktopFileName("open_chroma")
+    
     app = QApplication(sys.argv)
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    icon_path = os.path.join(script_dir, "assets", "OpenChroma.png")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+        
     ex = NagaSynapseApp()
     ex.show()
     sys.exit(app.exec())

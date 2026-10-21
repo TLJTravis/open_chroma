@@ -63,4 +63,10 @@ fi
 
 update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
 
+# Dynamically update the installed desktop file with the current user's absolute paths
+if [ -f "$DESKTOP_DIR/openchroma.desktop" ]; then
+    sed -i "s|Exec=open_chroma|Exec=$INSTALL_DIR/openchroma|g" "$DESKTOP_DIR/openchroma.desktop"
+    sed -i "s|Icon=openchroma|Icon=$ICON_DIR/OpenChroma.png|g" "$DESKTOP_DIR/openchroma.desktop"
+fi
+
 echo "Installation complete and verified! OpenChroma is ready to use."
