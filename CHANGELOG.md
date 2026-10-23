@@ -8,13 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ## [Unreleased]
-Wayland compositor integrations is currently NOT planned. Feel free to fork this program if you wish for it to work on Wayland
+Wayland compositor integrations is currently NOT planned with this X11 version. Testing to begin soon on a Wayland only version of OpenChroma with my secondary Ubuntu machine.
 
 ### Planned
 - SHA-256 checksum verification during installation.
 - Improved OpenRazer device access validation and hardware detection.
 - Clean process signal handling (`SIGINT`/`SIGTERM`).
 
+---
+## [1.0.4] - Dual-Peripheral Header & Custom Device Icons 2026-10-22
+### Added
+- **Dual-Peripheral Header Layout:** Refactored top device info card into a dedicated dual-icon and dual-label system (`keyboard_icon_lbl`, `keyboard_lbl`, `mouse_icon_lbl`, `mouse_lbl`) to independently present status and thumbnails for connected devices.
+- **Distinct Device Fallback Assets:** Integrated custom fallback asset support (`keyboard_default.png` and `mouse_default.png`) to render tailored gaming-themed graphics when remote hardware images are unavailable.
+- **Core Backend Module Integration:** Formally tracked and packaged `razer_backend.py` as a core dependency for direct OpenRazer device communication and lighting control.
+
+### Changed
+- **Independent Hardware Label Updates:** Updated `update_detected_hardware_labels` to independently fetch, smooth-scale, and render distinct icon pixmaps alongside text descriptions for both peripherals.
+
+### Fixed
+- **Robust Image Caching & Size Validation:** Enhanced `get_cached_device_image` with a dynamic `fallback` parameter and automatic size-validation cleanup to discard invalid or 404 error stubs (< 100 bytes) from `~/.cache/openchroma/images/`.
+- **Network Error Resolution:** Prevented HTTP 404 exceptions by gracefully falling back to local project assets (`assets/`) when remote GitHub data paths fail or are omitted.
 ---
 ## [1.0.3] - Window Geometry, Asset Path Resolution, UX/UI Changes 2026-10-20
 ### Added

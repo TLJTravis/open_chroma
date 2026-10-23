@@ -8,6 +8,7 @@
 # ==============================================================================
 
 import sys, json, os, glob, subprocess, logging, threading
+import urllib.request
 from threading import Thread
 from PyQt6.QtWidgets import (QApplication, QWidget, QGridLayout, QPushButton,
                              QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -18,6 +19,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint, QRectF
 from PyQt6.QtGui import QColor, QPainter, QLinearGradient, QMouseEvent, QPen, QFont, QIcon, QAction, QPixmap
 from Xlib import X, display, XK
 from Xlib.ext import xtest
+from razer_backend import RazerBackend
 
 # ==============================================================================
 # GLOBAL CONFIGURATION & CONSTANTS
@@ -30,6 +32,44 @@ logger = logging.getLogger("OpenChroma")
 
 PROFILE_FILE = os.path.expanduser("~/.config/naga_profiles.json")
 RAZER_VENDOR_ID = 0x1532
+
+# ==============================================================================
+# HARDWARE IMAGE CACHING HELPER
+# ==============================================================================
+# Update signature to accept 'fallback'
+def get_cached_device_image(device_name, image_url, fallback="OpenChroma"):
+    cache_dir = os.path.expanduser("~/.cache/openchroma/images")
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    if not device_name:
+        device_name = "unknown_device"
+        
+    safe_name = str(device_name).lower().replace(" ", "_") + ".png"
+    local_path = os.path.join(cache_dir, safe_name)
+    
+    # Remove any existing tiny error/404 stubs (< 100 bytes)
+    if os.path.exists(local_path) and os.path.getsize(local_path) < 100:
+        os.remove(local_path)
+    
+    if not os.path.exists(local_path) and image_url:
+        try:
+            urllib.request.urlretrieve(image_url, local_path)
+            if os.path.exists(local_path) and os.path.getsize(local_path) < 100:
+                os.remove(local_path)
+        except Exception as e:
+            print(f"Failed to download device image: {e}")
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            
+    # Fallback to the specified local app icon if remote image is missing or failed
+    if not os.path.exists(local_path):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Use the passed fallback name (e.g., "keyboard_default")
+        fallback_path = os.path.join(script_dir, "assets", f"{fallback}.png")
+        if os.path.exists(fallback_path):
+            return fallback_path
+            
+    return local_path if os.path.exists(local_path) else None
 
 # ==============================================================================
 # 0. DPI OSD NOTIFICATION POPUP WIDGET
@@ -398,6 +438,7 @@ class NagaSynapseApp(QWidget):
         self.shutdown_event = threading.Event()
         
         self.profiles = self.load_profiles()
+        self.razer = RazerBackend()
         self.is_mmo_mouse = self.detect_mmo_mouse()
         
         self.current_target = "mouse"
@@ -475,29 +516,17 @@ class NagaSynapseApp(QWidget):
         event.accept()
 
     def detect_mmo_mouse(self):
-        m_path = self.find_mouse_sysfs_path()
-        if m_path and ("0067" in m_path or "005a" in m_path or "naga" in m_path.lower()):
-            logger.info("Detected MMO mouse via sysfs path.")
+        if self.razer.is_mmo_mouse():
+            logger.info(f"Detected MMO mouse: {self.razer.name('mouse')}")
             return True
-            
-        import evdev
-        for path in evdev.list_devices():
-            try:
-                dev = evdev.InputDevice(path)
-                if dev.info.vendor != RAZER_VENDOR_ID:
-                    continue
-                caps = dev.capabilities()
-                if evdev.ecodes.EV_KEY in caps:
-                    keys = caps[evdev.ecodes.EV_KEY]
-                    if evdev.ecodes.KEY_EQUAL in keys and "pointer" not in dev.name.lower():
-                        logger.info(f"Detected MMO mouse via evdev: {dev.name}")
-                        return True
-            except Exception as e:
-                logger.debug(f"Error checking device {path} for MMO detection: {e}")
-        
-        logger.warning("No MMO-specific Razer mouse detected; defaulting to standard 2-button layout.")
+        logger.warning("No Naga detected via openrazer; defaulting to standard 2-button layout.")
         return False
 
+    def _apply_hw_dpi(self, dpi):
+        """Send DPI to the mouse only when it changed (the slider fires many events)."""
+        if getattr(self, "_last_hw_dpi", None) != dpi and self.razer.set_dpi(dpi):
+            self._last_hw_dpi = dpi
+            
     def set_exact_dpi_preset(self, target_dpi, trigger_osd=False):
         self.dpi_slider.blockSignals(True)
         self.dpi_slider.setValue(target_dpi)
@@ -505,7 +534,7 @@ class NagaSynapseApp(QWidget):
         self.dpi_label.setText(f"Current DPI: <b>{target_dpi}</b> (Preset Stage)")
         if target_dpi in self.dpi_stages:
             self.current_dpi_index = self.dpi_stages.index(target_dpi)
-        
+
         curr_prof = self.get_active_profile_name()
         if curr_prof in self.profiles and isinstance(self.profiles[curr_prof], dict):
             if "bindings" in self.profiles[curr_prof]:
@@ -514,15 +543,16 @@ class NagaSynapseApp(QWidget):
                 bindings = self.profiles[curr_prof].copy()
                 self.profiles[curr_prof] = {"bindings": bindings, "dpi": target_dpi}
 
+        self._apply_hw_dpi(target_dpi)
         if trigger_osd:
             self.osd.show_dpi(target_dpi)
-
+            
     def on_dpi_slider_changed(self, value):
         closest_dpi = min(self.dpi_stages, key=lambda x: abs(x - value))
         self.set_exact_dpi_preset(closest_dpi, trigger_osd=False)
 
     def initUI(self):
-        self.setWindowTitle('OpenChroma Controls (Universal X11 - 1.0.3)')
+        self.setWindowTitle('OpenChroma Controls (Universal X11 - 1.0.4)')
         
         script_dir = os.path.dirname(os.path.abspath(__file__))
         icon_path = os.path.join(script_dir, "assets", "OpenChroma.png")
@@ -560,9 +590,32 @@ class NagaSynapseApp(QWidget):
         info_layout = QHBoxLayout(self.device_info_card)
         info_layout.setContentsMargins(15, 10, 15, 10)
         
-        self.detected_hardware_lbl = QLabel("<b>Detected Hardware:</b> Scanning system...")
-        self.detected_hardware_lbl.setStyleSheet("color: #00ff00; font-size: 12px;")
-        info_layout.addWidget(self.detected_hardware_lbl)
+        # --- Keyboard Icon & Label ---
+        self.keyboard_icon_lbl = QLabel()
+        self.keyboard_icon_lbl.setFixedSize(50, 30)
+        self.keyboard_icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        info_layout.addWidget(self.keyboard_icon_lbl)
+        
+        self.keyboard_lbl = QLabel("<b>Keyboard:</b> Scanning...")
+        self.keyboard_lbl.setStyleSheet("color: #00ff00; font-size: 12px;")
+        info_layout.addWidget(self.keyboard_lbl)
+        
+        # --- Separator ---
+        separator = QLabel("&nbsp;&nbsp;|&nbsp;&nbsp;")
+        separator.setStyleSheet("color: #888888; font-size: 12px;")
+        info_layout.addWidget(separator)
+        
+        # --- Mouse Icon & Label ---
+        self.mouse_icon_lbl = QLabel()
+        self.mouse_icon_lbl.setFixedSize(50, 30)
+        self.mouse_icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        info_layout.addWidget(self.mouse_icon_lbl)
+        
+        self.mouse_lbl = QLabel("<b>Mouse:</b> Scanning...")
+        self.mouse_lbl.setStyleSheet("color: #00ff00; font-size: 12px;")
+        info_layout.addWidget(self.mouse_lbl)
+        
+        info_layout.addStretch()
         
         main_layout.addWidget(self.device_info_card)
 
@@ -898,46 +951,43 @@ X-GNOME-Autostart-enabled=true
                     self.register_active_alias(matched_profile, window_title)
 
     def update_detected_hardware_labels(self):
-        keyboard_name = "Razer Ornata V2"
-        mouse_name = "Razer Naga Trinity"
+        import html
+        kb_name = self.razer.name('keyboard')
+        mouse_name = self.razer.name('mouse')
         
-        try:
-            kb_path = self.find_keyboard_sysfs_path()
-            if kb_path:
-                base_dir = os.path.dirname(kb_path)
-                device_name_file = os.path.join(base_dir, "device_name")
-                if os.path.exists(device_name_file):
-                    with open(device_name_file, "r") as f:
-                        keyboard_name = f.read().strip()
-                else:
-                    base_hid = os.path.dirname(os.path.dirname(kb_path))
-                    name_file = os.path.join(base_hid, "product")
-                    if os.path.exists(name_file):
-                        with open(name_file, "r") as f:
-                            keyboard_name = f.read().strip()
-        except Exception as e:
-            logger.debug(f"Could not read keyboard sysfs product name: {e}")
+        # Update text labels
+        self.keyboard_lbl.setText(f"<b>Keyboard:</b> {html.escape(kb_name)}")
+        
+        mouse_text = f"<b>Mouse:</b> {html.escape(mouse_name)}"
+        if self.razer.error:
+            mouse_text += f" &nbsp;&nbsp;|&nbsp;&nbsp; <span style='color:#ff6666;'>{html.escape(self.razer.error)}</span>"
+        self.mouse_lbl.setText(mouse_text)
 
-        try:
-            m_path = self.find_mouse_sysfs_path()
-            if m_path:
-                base_dir = os.path.dirname(m_path)
-                device_name_file = os.path.join(base_dir, "device_name")
-                if os.path.exists(device_name_file):
-                    with open(device_name_file, "r") as f:
-                        mouse_name = f.read().strip()
-                else:
-                    base_hid = os.path.dirname(os.path.dirname(m_path))
-                    name_file = os.path.join(base_hid, "product")
-                    if os.path.exists(name_file):
-                        with open(name_file, "r") as f:
-                            mouse_name = f.read().strip()
-        except Exception as e:
-            logger.debug(f"Could not read mouse sysfs product name: {e}")
+        # --- Load and Display Keyboard Icon ---
+        # Pass "keyboard_default" as the fallback parameter
+        kb_image_path = get_cached_device_image(kb_name, None, fallback="keyboard_default")
+        if kb_image_path and os.path.exists(kb_image_path):
+            kb_pixmap = QPixmap(kb_image_path).scaled(
+                50, 30, 
+                Qt.AspectRatioMode.KeepAspectRatio, 
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.keyboard_icon_lbl.setPixmap(kb_pixmap)
+        else:
+            self.keyboard_icon_lbl.clear()
 
-        self.detected_hardware_lbl.setText(
-            f"<b>Keyboard:</b> {keyboard_name} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Mouse:</b> {mouse_name}"
-        )
+        # --- Load and Display Mouse Icon ---
+        # Pass "mouse_default" as the fallback parameter
+        mouse_image_path = get_cached_device_image(mouse_name, None, fallback="mouse_default")
+        if mouse_image_path and os.path.exists(mouse_image_path):
+            mouse_pixmap = QPixmap(mouse_image_path).scaled(
+                50, 30, 
+                Qt.AspectRatioMode.KeepAspectRatio, 
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.mouse_icon_lbl.setPixmap(mouse_pixmap)
+        else:
+            self.mouse_icon_lbl.clear()
 
     def set_panel_view(self, panel_type):
         self.current_active_panel = panel_type
@@ -1016,8 +1066,14 @@ X-GNOME-Autostart-enabled=true
         
         polling_layout = QHBoxLayout()
         self.poll_combo = QComboBox()
-        self.poll_combo.addItems(["125 Hz", "500 Hz", "1000 Hz"])
-        self.poll_combo.setCurrentText("1000 Hz")
+        rates = [f"{r} Hz" for r in self.razer.supported_poll_rates()]
+        self.poll_combo.addItems(rates)
+        current_rate = self.razer.get_poll_rate()
+        if current_rate and f"{current_rate} Hz" in rates:
+            self.poll_combo.setCurrentText(f"{current_rate} Hz")
+        self.poll_combo.setEnabled(self.razer.has("mouse", "poll_rate"))
+        self.poll_combo.currentTextChanged.connect(
+            lambda text: self.razer.set_poll_rate(int(text.split()[0])))
         polling_layout.addWidget(self.poll_combo)
         polling_layout.addStretch()
         card_layout.addLayout(polling_layout)
@@ -1285,82 +1341,36 @@ X-GNOME-Autostart-enabled=true
         else:
             QMessageBox.warning(self, "Invalid Hex", f"Could not parse '{text}' as a valid hex color code. Use format #ff0000.")
 
-    def find_keyboard_sysfs_path(self):
-        paths = glob.glob("/sys/bus/hid/devices/0003:1532:*.*/matrix_effect_static")
-        for path in paths:
-            if not any(m_id in path for m_id in ["0067", "005a", "0043", "0078", "0084"]):
-                return path
-        if paths:
-            return paths[0]
-        return "/sys/bus/hid/devices/0003:1532:025D.0003/matrix_effect_static"
-
-    def find_mouse_sysfs_path(self):
-        paths = glob.glob("/sys/bus/hid/devices/0003:1532:*.*/matrix_effect_static")
-        for path in paths:
-            if any(m_id in path for m_id in ["0067", "005a", "0043", "0078", "0084", "mouse"]):
-                return path
-        bright_paths = glob.glob("/sys/bus/hid/devices/0003:1532:*.*/matrix_brightness")
-        for path in bright_paths:
-            if not any(k_id in path for k_id in ["025D"]):
-                return path.replace("matrix_brightness", "matrix_effect_static")
-        return "/sys/bus/hid/devices/0003:1532:0067.0005/matrix_effect_static"
-
     def apply_static_color_to_device(self, target, r, g, b):
-        try:
-            if target == "mouse":
-                sysfs_path = self.find_mouse_sysfs_path()
-            else:
-                sysfs_path = self.find_keyboard_sysfs_path()
-                
-            color_bytes = bytes([r, g, b])
-            if sysfs_path and os.path.exists(sysfs_path):
-                with open(sysfs_path, "wb") as f:
-                    f.write(color_bytes)
-        except Exception as e:
-            logger.debug(f"Failed to apply static color to {target}: {e}")
+        self.razer.set_static(target, r, g, b)
 
     def on_effect_mode_changed(self, index):
         effect_name = self.effect_combo.currentText()
         st = self.device_states[self.current_target]
         st["effect"] = effect_name
-
         is_breathe = (effect_name == "Breathe")
-        
-        if self.current_target == "mouse":
-            if is_breathe:
-                self.effect_combo.blockSignals(True)
-                self.effect_combo.setCurrentText("Static (Custom Color)")
-                self.effect_combo.blockSignals(False)
-                st["effect"] = "Static (Custom Color)"
-                is_breathe = False
 
-        if is_breathe and self.current_target == "keyboard":
+        if self.current_target == "mouse" and is_breathe:
+            # The Naga Trinity only exposes static lighting
+            self.effect_combo.blockSignals(True)
+            self.effect_combo.setCurrentText("Static (Custom Color)")
+            self.effect_combo.blockSignals(False)
+            st["effect"] = "Static (Custom Color)"
+            is_breathe = False
+
+        col = st["color"]
+        if is_breathe:
             self.bright_slider.hide()
             self.bright_label.hide()
             self.breathe_container.show()
             st["breathe_val"] = st["breathe_min"]
-            col = st["color"]
-            self.apply_static_color_to_device(self.current_target, col.red(), col.green(), col.blue())
+            self.razer.set_static(self.current_target, col.red(), col.green(), col.blue())
         else:
             self.breathe_container.hide()
             self.bright_slider.show()
             self.bright_label.show()
-            
-            col = st["color"]
-            self.apply_static_color_to_device(self.current_target, col.red(), col.green(), col.blue())
-            
-            try:
-                if self.current_target == "mouse":
-                    base_dir = os.path.dirname(self.find_mouse_sysfs_path())
-                else:
-                    base_dir = os.path.dirname(self.find_keyboard_sysfs_path())
-                sysfs_path = os.path.join(base_dir, "matrix_brightness")
-                    
-                if os.path.exists(sysfs_path):
-                    with open(sysfs_path, "w") as f:
-                        f.write(str(st["brightness"]))
-            except Exception as e:
-                logger.debug(f"Failed to apply brightness setting: {e}")
+            self.razer.set_static(self.current_target, col.red(), col.green(), col.blue())
+            self.razer.set_brightness(self.current_target, st["brightness"])
 
     def on_breathe_range_changed(self):
         min_val = self.breathe_min_slider.value()
@@ -1381,54 +1391,34 @@ X-GNOME-Autostart-enabled=true
         st["breathe_speed"] = value
 
     def run_independent_breathe_steps(self):
-        for target in ["keyboard"]:
-            st = self.device_states[target]
-            if st["effect"] == "Breathe":
-                min_val = st["breathe_min"]
-                max_val = st["breathe_max"]
-                if min_val >= max_val:
-                    max_val = min_val + 1
+        st = self.device_states["keyboard"]
+        if st["effect"] != "Breathe":
+            return
+        min_val = st["breathe_min"]
+        max_val = st["breathe_max"]
+        if min_val >= max_val:
+            max_val = min_val + 1
 
-                speed = st["breathe_speed"]
-                step = 1 if speed == 1 else (2 if speed == 2 else 4)
+        speed = st["breathe_speed"]
+        step = 1 if speed == 1 else (2 if speed == 2 else 4)
 
-                st["breathe_val"] += (st["breathe_dir"] * step)
+        st["breathe_val"] += st["breathe_dir"] * step
+        if st["breathe_val"] >= max_val:
+            st["breathe_val"] = max_val
+            st["breathe_dir"] = -1
+        elif st["breathe_val"] <= min_val:
+            st["breathe_val"] = min_val
+            st["breathe_dir"] = 1
 
-                if st["breathe_val"] >= max_val:
-                    st["breathe_val"] = max_val
-                    st["breathe_dir"] = -1
-                elif st["breathe_val"] <= min_val:
-                    st["breathe_val"] = min_val
-                    st["breathe_dir"] = 1
-
-                val_str = str(int(st["breathe_val"]))
-                try:
-                    base_dir = os.path.dirname(self.find_keyboard_sysfs_path())
-                    path = os.path.join(base_dir, "matrix_brightness")
-                        
-                    if os.path.exists(path):
-                        with open(path, "w") as f:
-                            f.write(val_str)
-                except Exception as e:
-                    logger.debug(f"Failed to update breathe effect step: {e}")
+        value = int(st["breathe_val"])
+        if value != st.get("_last_sent"):
+            st["_last_sent"] = value
+            self.razer.set_brightness("keyboard", value)
 
     def on_brightness_changed(self, value):
         self.bright_label.setText(f"Brightness: <b>{value}%</b>")
-        st = self.device_states[self.current_target]
-        st["brightness"] = value
-        
-        try:
-            if self.current_target == "mouse":
-                base_dir = os.path.dirname(self.find_mouse_sysfs_path())
-            else:
-                base_dir = os.path.dirname(self.find_keyboard_sysfs_path())
-            sysfs_path = os.path.join(base_dir, "matrix_brightness")
-                
-            if os.path.exists(sysfs_path):
-                with open(sysfs_path, "w") as f:
-                    f.write(str(value))
-        except Exception as e:
-            logger.debug(f"Failed to set brightness: {e}")
+        self.device_states[self.current_target]["brightness"] = value
+        self.razer.set_brightness(self.current_target, value)
 
     def handle_mouse_function_selection(self, index):
         if index > 0:
@@ -1776,6 +1766,7 @@ X-GNOME-Autostart-enabled=true
             self.dpi_slider.setValue(target_dpi)
             self.dpi_slider.blockSignals(False)
             self.dpi_label.setText(f"Current DPI: <b>{target_dpi}</b> (Profile Preset)")
+            self._apply_hw_dpi(target_dpi)
 
     def create_profile(self):
         text, ok = QInputDialog.getText(self, 'New Profile', 'Enter name:')
