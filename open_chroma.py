@@ -601,7 +601,7 @@ class NagaSynapseApp(QWidget):
         info_layout.addWidget(self.keyboard_lbl)
         
         # --- Separator ---
-        separator = QLabel("&nbsp;&nbsp;|&nbsp;&nbsp;")
+        separator = QLabel("  |  ")
         separator.setStyleSheet("color: #888888; font-size: 12px;")
         info_layout.addWidget(separator)
         
