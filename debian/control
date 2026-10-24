@@ -1,0 +1,8 @@
+Package: openchroma
+Version: 1.0.5
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: TLJTravis <tljtravis@gmail.com>
+Depends: python3 (>= 3.8), python3-pyqt6, python3-evdev, python3-dbus, xdotool, openrazer-meta
+Description: Universal peripheral configuration and macro remapping utility for Razer devices on Linux.
