@@ -26,11 +26,11 @@ jobs:
 
       - name: Build Standalone Executable
         run: |
-          pyinstaller --onefile --windowed --add-data "assets:assets" open_chroma.py
+          pyinstaller --onefile --windowed --add-data "assets:assets" openchroma
 
       - name: Create Release and Upload Binary
         uses: softprops/action-gh-release@v1
         with:
-          files: dist/open_chroma
+          files: dist/openchroma
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
