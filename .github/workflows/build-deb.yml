@@ -43,10 +43,10 @@ jobs:
           # Create wrapper script in /usr/bin
           cat << 'EOF' > "$PKG_DIR/usr/bin/openchroma"
           #!/bin/bash
-          exec python3 /usr/share/openchroma/open_chroma.py "$@"
+          exec python3 /usr/share/openchroma/openchroma "$@"
           EOF
           chmod +x "$PKG_DIR/usr/bin/openchroma"
-          chmod +x "$PKG_DIR/usr/share/openchroma/open_chroma.py"
+          chmod +x "$PKG_DIR/usr/share/openchroma/openchroma"
 
           # Build the .deb package
           dpkg-deb --build "$PKG_DIR"
