@@ -28,7 +28,6 @@ jobs:
         run: |
           cp openchroma open_chroma.py
           pyinstaller --name openchroma --onefile --windowed --add-data "assets:assets" open_chroma.py
-
       - name: Create Release and Upload Binary
         uses: softprops/action-gh-release@v1
         with:
