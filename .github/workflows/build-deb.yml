@@ -37,7 +37,7 @@ jobs:
           cp openchroma "$PKG_DIR/usr/share/openchroma/"
           cp razer_backend.py "$PKG_DIR/usr/share/openchroma/"
           cp assets/OpenChroma.png "$PKG_DIR/usr/share/openchroma/assets/"
-          cp open_chroma.desktop "$PKG_DIR/usr/share/applications/"
+          cp openchroma.desktop "$PKG_DIR/usr/share/applications/"
           cp assets/OpenChroma.png "$PKG_DIR/usr/share/icons/hicolor/scalable/apps/OpenChroma.png"
 
           # Create wrapper script in /usr/bin
