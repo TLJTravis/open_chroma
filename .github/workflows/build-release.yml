@@ -27,6 +27,8 @@ jobs:
       - name: Build Standalone Executable
         run: |
           ls -la
+          - name: Build Standalone Executable
+        run: |
           cp openchroma open_chroma.py
           pyinstaller --name openchroma --onefile --windowed --add-data "assets:assets" open_chroma.py
       - name: Create Release and Upload Binary
