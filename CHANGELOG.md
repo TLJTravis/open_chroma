@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.6] - Debian Packaging Fixes & Path Resolution - 2026-10-25
+
+### Fixed
+- **Debian Packaging (`debian/control`)**: Corrected package dependencies and build configurations to ensure smooth installation via `.deb` packages.
+- **Module Paths & Symlinks**: Fixed binary symlinks and module resolution paths so OpenChroma executes reliably from system paths.
+- **Hardware Detection**: Verified proper udev rules and user permission mappings for seamless Razer peripheral detection across both X11 and Wayland sessions.
+
+---
+
 ## [1.0.5] - Wayland/X11 Hybrid Support & Pointer Freedom - 2026-10-24
 
 ### Added
