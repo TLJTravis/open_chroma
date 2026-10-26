@@ -1,0 +1,5 @@
+cat << 'EOF' > udev/99-razer.rules
+# Razer hardware permissions for OpenChroma
+KERNEL=="hidraw*", ATTRS{idVendor}=="1532", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="input", ATTRS{idVendor}=="1532", MODE="0660", GROUP="input"
+EOF

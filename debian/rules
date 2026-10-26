@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# No build step required
+
+override_dh_auto_install:
+	mkdir -p debian/openchroma/usr/bin
+	mkdir -p debian/openchroma/usr/share/openchroma
+	mkdir -p debian/openchroma/etc/udev/rules.d
+	mkdir -p debian/openchroma/usr/share/applications
+	install -m 755 openchroma debian/openchroma/usr/share/openchroma/openchroma
+	cp *.py debian/openchroma/usr/share/openchroma/ 2>/dev/null || true
+	ln -s /usr/share/openchroma/openchroma debian/openchroma/usr/bin/openchroma
+	install -m 644 udev/99-razer.rules debian/openchroma/etc/udev/rules.d/99-razer.rules
+	[ -f open_chroma.desktop ] && install -m 644 open_chroma.desktop debian/openchroma/usr/share/applications/openchroma.desktop || true

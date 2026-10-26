@@ -8,7 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ## [Unreleased]
-Wayland compositor integrations is currently NOT planned with this X11 version. Testing to begin soon on a Wayland only version of OpenChroma with my secondary Ubuntu machine.
 
 ### Planned
 - SHA-256 checksum verification during installation.
@@ -16,7 +15,23 @@ Wayland compositor integrations is currently NOT planned with this X11 version. 
 - Clean process signal handling (`SIGINT`/`SIGTERM`).
 
 ---
-## [1.0.4] - Dual-Peripheral Header & Custom Device Icons 2026-10-22
+
+## [1.0.5] - Wayland/X11 Hybrid Support & Pointer Freedom - 2026-10-24
+
+### Added
+- **Hybrid X11 & Wayland Display Engine**: Automatic runtime environment detection fallback using `QT_QPA_PLATFORM="wayland;xcb"`.
+- **Cross-Platform Auto-Profile Switcher**: Dual-backend window tracking incorporating `xdotool` for X11/Cinnamon (Linux Mint) and GNOME Shell DBus for Wayland (Ubuntu).
+- **Universal Hardware Peripheral Scanner**: Dynamic detection and support for any connected Razer mouse or keyboard via OpenRazer and `evdev`.
+- **XDG Autostart Integration**: Desktop autostart toggle within UI settings with automatic `.desktop` file creation and removal.
+- **System Tray Management**: System tray icon with quick game profile switching and window visibility controls.
+
+### Fixed
+- **System Cursor Freeze**: Isolated input grabbing logic specifically to keypad/macro nodes, excluding relative motion (`EV_REL`) devices to preserve system pointer movement.
+- **X11 Display Scaling**: Prevented interface clipping on various desktop environments and display configurations.
+- **Python Bytecode Cache Invalidation**: Ensured reliable module loading during cross-machine deployments.
+
+---
+## [1.0.4] - Dual-Peripheral Header & Custom Device Icons - 2026-10-22
 ### Added
 - **Dual-Peripheral Header Layout:** Refactored top device info card into a dedicated dual-icon and dual-label system (`keyboard_icon_lbl`, `keyboard_lbl`, `mouse_icon_lbl`, `mouse_lbl`) to independently present status and thumbnails for connected devices.
 - **Distinct Device Fallback Assets:** Integrated custom fallback asset support (`keyboard_default.png` and `mouse_default.png`) to render tailored gaming-themed graphics when remote hardware images are unavailable.
@@ -29,7 +44,7 @@ Wayland compositor integrations is currently NOT planned with this X11 version. 
 - **Robust Image Caching & Size Validation:** Enhanced `get_cached_device_image` with a dynamic `fallback` parameter and automatic size-validation cleanup to discard invalid or 404 error stubs (< 100 bytes) from `~/.cache/openchroma/images/`.
 - **Network Error Resolution:** Prevented HTTP 404 exceptions by gracefully falling back to local project assets (`assets/`) when remote GitHub data paths fail or are omitted.
 ---
-## [1.0.3] - Window Geometry, Asset Path Resolution, UX/UI Changes 2026-10-20
+## [1.0.3] - Window Geometry, Asset Path Resolution, UX/UI Changes - 2026-10-20
 ### Added
 - Window geometry tracking: OpenChroma now remembers and retains its exact screen position and monitor when minimized and restored from the system tray.
 - Profile deletion confirmation: Added a safety prompt dialog to prevent accidental deletion of custom configuration profiles.
@@ -54,7 +69,7 @@ Wayland compositor integrations is currently NOT planned with this X11 version. 
 * **Terminal Output Optimization:** Commented out verbose raw `evdev` event debug printing in the primary input loop for clean production logging.
 
 ---
-## [1.0.1] - Minor bug Fixes and Window Switching 10/18/2026
+## [1.0.1] - Minor bug Fixes and Window Switching - 10/18/2026
 ### Added
 A quick summary of what we completed today:
 

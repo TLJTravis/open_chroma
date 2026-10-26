@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 
 # ==============================================================================
-# OPENCHROMA - UNIVERSAL PERIPHERAL CONTROL UTILITY FOR LINUX (X11 ONLY)
+# OPENCHROMA - UNIVERSAL PERIPHERAL CONTROL UTILITY FOR LINUX (UNIVERSAL)
 # Author: TLJTravis
 # Description: Per-profile key remapping, automated window switching, and Chroma lighting.
-# Supports X11 display environments via Xlib and xdotool.
+# Supports Wayland & X11 across GNOME, Cinnamon, KDE, and XFCE via multi-backend detection.
 # ==============================================================================
 
-import sys, json, os, glob, subprocess, logging, threading
-import urllib.request
+import sys, json, os, glob, subprocess, logging, threading, time, urllib.request
+from pathlib import Path
+
+# Ensure Python looks in the script's own folder for local modules (e.g. razer_backend)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, "/usr/share/openchroma")
+
 from threading import Thread
 from PyQt6.QtWidgets import (QApplication, QWidget, QGridLayout, QPushButton,
                              QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -17,8 +22,15 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QGridLayout, QPushButton,
                              QSystemTrayIcon, QMenu, QCheckBox, QStyle)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint, QRectF
 from PyQt6.QtGui import QColor, QPainter, QLinearGradient, QMouseEvent, QPen, QFont, QIcon, QAction, QPixmap
-from Xlib import X, display, XK
-from Xlib.ext import xtest
+
+try:
+    import dbus
+    HAS_DBUS = True
+except ImportError:
+    HAS_DBUS = False
+
+import evdev
+from evdev import UInput, ecodes as e
 from razer_backend import RazerBackend
 
 # ==============================================================================
@@ -28,7 +40,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-logger = logging.getLogger("OpenChroma")
+logger = logging.getLogger("OpenChroma-Universal")
 
 PROFILE_FILE = os.path.expanduser("~/.config/naga_profiles.json")
 RAZER_VENDOR_ID = 0x1532
@@ -36,7 +48,16 @@ RAZER_VENDOR_ID = 0x1532
 # ==============================================================================
 # HARDWARE IMAGE CACHING HELPER
 # ==============================================================================
-# Update signature to accept 'fallback'
+def get_asset_path(filename):
+    paths = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", filename),
+        os.path.join("/usr/share/openchroma/assets", filename)
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return paths[0]
+
 def get_cached_device_image(device_name, image_url, fallback="OpenChroma"):
     cache_dir = os.path.expanduser("~/.cache/openchroma/images")
     os.makedirs(cache_dir, exist_ok=True)
@@ -47,7 +68,6 @@ def get_cached_device_image(device_name, image_url, fallback="OpenChroma"):
     safe_name = str(device_name).lower().replace(" ", "_") + ".png"
     local_path = os.path.join(cache_dir, safe_name)
     
-    # Remove any existing tiny error/404 stubs (< 100 bytes)
     if os.path.exists(local_path) and os.path.getsize(local_path) < 100:
         os.remove(local_path)
     
@@ -57,15 +77,12 @@ def get_cached_device_image(device_name, image_url, fallback="OpenChroma"):
             if os.path.exists(local_path) and os.path.getsize(local_path) < 100:
                 os.remove(local_path)
         except Exception as e:
-            print(f"Failed to download device image: {e}")
+            logger.debug(f"Failed to download device image: {e}")
             if os.path.exists(local_path):
                 os.remove(local_path)
             
-    # Fallback to the specified local app icon if remote image is missing or failed
     if not os.path.exists(local_path):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        # Use the passed fallback name (e.g., "keyboard_default")
-        fallback_path = os.path.join(script_dir, "assets", f"{fallback}.png")
+        fallback_path = get_asset_path(f"{fallback}.png")
         if os.path.exists(fallback_path):
             return fallback_path
             
@@ -81,7 +98,6 @@ class DpiOsdOverlay(QLabel):
             Qt.WindowType.FramelessWindowHint | 
             Qt.WindowType.WindowStaysOnTopHint | 
             Qt.WindowType.Tool | 
-            Qt.WindowType.X11BypassWindowManagerHint |
             Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -171,7 +187,7 @@ class GamutSpectrumWidget(QWidget):
         self.update()
 
 # ==============================================================================
-# 2. AUTO-PROFILE WORKER THREAD & SIGNAL BRIDGE
+# 2. UNIVERSAL AUTO-PROFILE WORKER THREAD (GNOME DBUS + X11 FALLBACK)
 # ==============================================================================
 class SignalBridge(QWidget):
     window_changed_signal = pyqtSignal(tuple)
@@ -183,32 +199,53 @@ class AutoProfileWorker(Thread):
         self.shutdown_event = shutdown_event
         self.daemon = True
         self.last_seen_window = None
+        self.session_type = os.environ.get("XDG_SESSION_TYPE", "x11").lower()
 
     def get_active_window_info(self):
-        try:
-            win_id_res = subprocess.run(["xdotool", "getactivewindow"], capture_output=True, text=True)
-            if win_id_res.returncode != 0 or not win_id_res.stdout.strip():
-                return "", [], ""
-            win_id = win_id_res.stdout.strip()
+        wm_class = ""
+        title = ""
+        
+        # 1. X11 Backend (Linux Mint / Xorg / Cinnamon) using xdotool
+        if self.session_type != "wayland" or os.environ.get("DISPLAY"):
+            try:
+                class_res = subprocess.run(
+                    ["xdotool", "getactivewindow", "getwindowclassname"], 
+                    capture_output=True, text=True, timeout=0.2
+                )
+                if class_res.returncode == 0:
+                    wm_class = class_res.stdout.strip().lower()
+                    
+                title_res = subprocess.run(
+                    ["xdotool", "getactivewindow", "getwindowname"], 
+                    capture_output=True, text=True, timeout=0.2
+                )
+                if title_res.returncode == 0:
+                    title = title_res.stdout.strip().lower()
+                    
+                if wm_class or title:
+                    return "x11_win", [wm_class], title
+            except Exception:
+                pass
 
-            class_res = subprocess.run(["xdotool", "getwindowclassname", win_id], capture_output=True, text=True)
-            class_tokens = [class_res.stdout.strip().lower()] if class_res.returncode == 0 and class_res.stdout.strip() else []
-            
-            name_res = subprocess.run(["xdotool", "getwindowname", win_id], capture_output=True, text=True)
-            name_str = name_res.stdout.strip().lower() if name_res.returncode == 0 else ""
+        # 2. Wayland / GNOME Shell DBus Backend
+        if HAS_DBUS:
+            try:
+                session_bus = dbus.SessionBus()
+                gnome_obj = session_bus.get_object('org.gnome.Shell', '/org/gnome/Shell')
+                gnome_iface = dbus.Interface(gnome_obj, 'org.gnome.Shell')
+                
+                js_code = 'global.display.focus_window ? global.display.focus_window.get_wm_class() + ":::" + global.display.focus_window.get_title() : ""'
+                result = gnome_iface.Eval(js_code)
+                
+                if result and result[0] and result[1]:
+                    val = str(result[1]).strip()
+                    if ":::" in val:
+                        w_class, w_title = val.split(":::", 1)
+                        return "wayland_win", [w_class.lower().strip()], w_title.lower().strip()
+            except Exception:
+                pass
 
-            xprop_res = subprocess.run(["xprop", "-id", win_id, "WM_CLASS"], capture_output=True, text=True)
-            if xprop_res.returncode == 0:
-                for part in xprop_res.stdout.lower().split("="):
-                    for token in part.split(","):
-                        clean_token = token.replace('"', '').strip()
-                        if clean_token and clean_token not in class_tokens:
-                            class_tokens.append(clean_token)
-            
-            return win_id, class_tokens, name_str
-        except Exception as e:
-            logger.debug(f"Failed to query active window via xdotool/xprop: {e}")
-            return "", [], ""
+        return "", [], ""
 
     def run(self):
         while not self.shutdown_event.is_set():
@@ -222,7 +259,7 @@ class AutoProfileWorker(Thread):
                 break
 
 # ==============================================================================
-# 3. LIVE INPUT DAEMON (X11 XLIb RE-MAPPING)
+# 3. LIVE INPUT DAEMON (MULTI-DEVICE SCANNER & UINPUT)
 # ==============================================================================
 class LiveInputDaemon(Thread):
     def __init__(self, get_current_profile_bindings_callback, app_reference, shutdown_event):
@@ -231,149 +268,109 @@ class LiveInputDaemon(Thread):
         self.get_bindings = get_current_profile_bindings_callback
         self.app = app_reference
         self.shutdown_event = shutdown_event
+        self.uinput = None
 
-    def find_keypad_device(self):
-        import evdev
+    def init_uinput(self):
+        try:
+            capabilities = {
+                e.EV_KEY: [
+                    e.KEY_A, e.KEY_B, e.KEY_C, e.KEY_D, e.KEY_E, e.KEY_F, e.KEY_G,
+                    e.KEY_H, e.KEY_I, e.KEY_J, e.KEY_K, e.KEY_L, e.KEY_M, e.KEY_N,
+                    e.KEY_O, e.KEY_P, e.KEY_Q, e.KEY_R, e.KEY_S, e.KEY_T, e.KEY_U,
+                    e.KEY_V, e.KEY_W, e.KEY_X, e.KEY_Y, e.KEY_Z,
+                    e.KEY_1, e.KEY_2, e.KEY_3, e.KEY_4, e.KEY_5, e.KEY_6, e.KEY_7,
+                    e.KEY_8, e.KEY_9, e.KEY_0, e.KEY_MINUS, e.KEY_EQUAL,
+                    e.KEY_LEFTCTRL, e.KEY_LEFTSHIFT, e.KEY_LEFTALT,
+                    e.KEY_F1, e.KEY_F2, e.KEY_F3, e.KEY_F4, e.KEY_F5, e.KEY_F6,
+                    e.KEY_F7, e.KEY_F8, e.KEY_F9, e.KEY_F10, e.KEY_F11, e.KEY_F12,
+                    e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE, e.BTN_SIDE, e.BTN_EXTRA
+                ],
+                e.EV_REL: [e.REL_WHEEL, e.REL_HWHEEL]
+            }
+            self.uinput = UInput(capabilities, name="OpenChroma-Virtual-Input")
+            logger.info("Initialized evdev UInput virtual device.")
+        except Exception as err:
+            logger.error(f"Failed to create UInput device: {err}")
 
-        if os.path.exists("/dev/input/event9"):
-            try:
-                dev = evdev.InputDevice("/dev/input/event9")
-                caps = dev.capabilities()
-                if evdev.ecodes.EV_KEY in caps:
-                    logger.info(f"Successfully bound Naga side-plate device at /dev/input/event9")
-                    return dev
-            except Exception as e:
-                logger.debug(f"Error checking /dev/input/event9: {e}")
-
+    def find_mouse_keypad_device(self):
         for path in evdev.list_devices():
             try:
                 dev = evdev.InputDevice(path)
-                if dev.info.vendor != RAZER_VENDOR_ID:
-                    continue
-
-                caps = dev.capabilities()
-                if evdev.ecodes.EV_KEY in caps:
-                    keys = caps[evdev.ecodes.EV_KEY]
-                    if all(k in keys for k in range(2, 10)):
-                        logger.info(f"Dynamically discovered Razer keypad matrix: {dev.name} at {path}")
+                if "Naga" in dev.name and evdev.ecodes.EV_KEY in dev.capabilities():
+                    caps = dev.capabilities()[evdev.ecodes.EV_KEY]
+                    if evdev.ecodes.KEY_1 in caps:
+                        logger.info(f"Discovered Razer Naga keypad at {path}")
                         return dev
-            except Exception as e:
-                logger.debug(f"Error inspecting device node {path}: {e}")
-
-        logger.warning("No compatible Razer Naga side-plate device detected.")
+            except Exception as err:
+                logger.debug(f"Error inspecting device {path}: {err}")
         return None
 
-    def sanitize_action(self, action_str):
-        mapping = {
-            "-": "minus", "=": "equal", "+": "plus", "_": "underscore",
-            "ctrl": "Control_L", "control": "Control_L",
-            "shift": "Shift_L", "alt": "Alt_L"
-        }
-        low = action_str.lower()
-        if low in mapping:
-            return mapping[low]
-        if action_str.startswith("KP_") or action_str.startswith("F") or "_" in action_str:
-            return action_str
-        return action_str
+    def send_combo_uinput(self, action_str, is_press):
+        if not self.uinput:
+            return
 
-    def send_combo(self, d_xlib, action_str, is_press):
         if "Click" in action_str:
             click_map = {
-                "Left Click": "1",
-                "Right Click": "3",
-                "Middle Click": "2"
+                "Left Click": e.BTN_LEFT, "Right Click": e.BTN_RIGHT,
+                "Middle Click": e.BTN_MIDDLE
             }
             if action_str in click_map and is_press:
-                subprocess.run(["xdotool", "click", click_map[action_str]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.uinput.write(e.EV_KEY, click_map[action_str], 1)
+                self.uinput.syn()
+            elif action_str in click_map and not is_press:
+                self.uinput.write(e.EV_KEY, click_map[action_str], 0)
+                self.uinput.syn()
             return
 
-        parts = action_str.split("+")
-        is_only_modifiers = all(p.lower() in ["ctrl", "control", "shift", "alt"] for p in parts)
-        
-        if is_only_modifiers:
-            cmd = "keydown" if is_press else "keyup"
-            xdotool_parts = []
-            for p in parts:
-                low = p.lower()
-                if "ctrl" in low or "control" in low:
-                    xdotool_parts.append("ctrl")
-                elif "shift" in low:
-                    xdotool_parts.append("shift")
-                elif "alt" in low:
-                    xdotool_parts.append("alt")
-            
-            if xdotool_parts:
-                xdotool_arg = "+".join(xdotool_parts)
-                subprocess.run(["xdotool", cmd, xdotool_arg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
+        key_map = {
+            "ctrl": e.KEY_LEFTCTRL, "control": e.KEY_LEFTCTRL,
+            "shift": e.KEY_LEFTSHIFT, "alt": e.KEY_LEFTALT,
+            "1": e.KEY_1, "2": e.KEY_2, "3": e.KEY_3, "4": e.KEY_4, "5": e.KEY_5,
+            "6": e.KEY_6, "7": e.KEY_7, "8": e.KEY_8, "9": e.KEY_9, "0": e.KEY_0,
+            "-": e.KEY_MINUS, "=": e.KEY_EQUAL,
+            "a": e.KEY_A, "b": e.KEY_B, "c": e.KEY_C, "d": e.KEY_D, "e": e.KEY_E,
+            "f": e.KEY_F, "g": e.KEY_G, "h": e.KEY_H, "i": e.KEY_I, "j": e.KEY_J,
+            "k": e.KEY_K, "l": e.KEY_L, "m": e.KEY_M, "n": e.KEY_N, "o": e.KEY_O,
+            "p": e.KEY_P, "q": e.KEY_Q, "r": e.KEY_R, "s": e.KEY_S, "t": e.KEY_T,
+            "u": e.KEY_U, "v": e.KEY_V, "w": e.KEY_W, "x": e.KEY_X, "y": e.KEY_Y,
+            "z": e.KEY_Z
+        }
 
-        keycodes = []
-        for part in parts:
-            clean_part = self.sanitize_action(part)
-            keysym = 0
-            if len(clean_part) == 1:
-                keysym = ord(clean_part[0])
-            else:
-                keysym = XK.string_to_keysym(clean_part)
-                
-            if keysym:
-                try:
-                    kc = d_xlib.keysym_to_keycode(keysym)
-                    if kc:
-                        keycodes.append(kc)
-                except Exception as e:
-                    logger.debug(f"Failed to map keysym for {clean_part}: {e}")
-        
+        parts = [p.lower().strip() for p in action_str.split("+")]
+        codes = [key_map[p] for p in parts if p in key_map]
+
         if is_press:
-            for kc in keycodes:
-                xtest.fake_input(d_xlib, X.KeyPress, kc)
+            for code in codes:
+                self.uinput.write(e.EV_KEY, code, 1)
         else:
-            for kc in reversed(keycodes):
-                xtest.fake_input(d_xlib, X.KeyRelease, kc)
-        if d_xlib:
-            d_xlib.sync()
+            for code in reversed(codes):
+                self.uinput.write(e.EV_KEY, code, 0)
+        self.uinput.syn()
 
     def run(self):
-        import evdev
         from select import select
+        self.init_uinput()
         
-        mouse_dev = self.find_keypad_device()
+        mouse_dev = self.find_mouse_keypad_device()
         if not mouse_dev:
-            logger.error("LiveInputDaemon aborted: No valid hardware device available.")
+            logger.error("LiveInputDaemon aborted: No Razer mouse keypad found.")
             return
         
         try:
             mouse_dev.grab()
-            logger.info(f"Successfully obtained exclusive device access for {mouse_dev.name}")
-        except PermissionError:
-            logger.error(f"Permission denied: Cannot obtain exclusive access to {mouse_dev.path}. Ensure your user is in the 'input' or 'plugdev' group.")
+            logger.info(f"Successfully grabbed mouse keypad: {mouse_dev.name}")
+        except Exception as err:
+            logger.error(f"Permission denied grabbing keypad: {err}")
             return
-        except OSError as e:
-            logger.error(f"Device busy or hardware error accessing {mouse_dev.path}: {e}")
-            return
-        except Exception as e:
-            logger.error(f"Unexpected error grabbing input device: {e}")
-            return
-
-        try:
-            d_xlib = display.Display()
-            logger.info("Initialized Xlib display connection for X11 session.")
-        except Exception as e:
-            logger.error(f"Failed to initialize X11 display connection: {e}")
-            return
-
-        trinity_map = {
-            2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 7: "6",
-            8: "7", 9: "8", 10: "9", 11: "10", 12: "11", 13: "12",
-            evdev.ecodes.BTN_MIDDLE: "Top_M", 
-            evdev.ecodes.BTN_FORWARD: "Top_Forward", 
-            evdev.ecodes.BTN_BACK: "Top_Back",
-            evdev.ecodes.REL_HWHEEL: "Scroll_Tilt"
-        }
 
         hardware_button_map = {
             2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 7: "6",
             8: "7", 9: "8", 10: "9", 11: "10", 12: "11", 13: "12"
+        }
+        trinity_map = {
+            2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 7: "6",
+            8: "7", 9: "8", 10: "9", 11: "10", 12: "11", 13: "12",
+            e.BTN_MIDDLE: "Top_M", e.BTN_FORWARD: "Top_Forward", e.BTN_BACK: "Top_Back"
         }
 
         try:
@@ -382,47 +379,71 @@ class LiveInputDaemon(Thread):
                 if mouse_dev.fileno() in r:
                     for event in mouse_dev.read():
                         bindings = self.get_bindings()
-                        
-                        if event.type == evdev.ecodes.EV_REL and event.code == evdev.ecodes.REL_HWHEEL:
-                            tilt_action = bindings.get("Scroll_Left" if event.value < 0 else "Scroll_Right", "")
-                            if tilt_action:
-                                subprocess.run(["xdotool", "click", "6" if event.value < 0 else "7"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            continue
-
                         if event.type != evdev.ecodes.EV_KEY:
                             continue
                         
-                        if event.code in hardware_button_map:
-                            button_str = hardware_button_map[event.code]
-                        else:
-                            button_str = trinity_map.get(event.code)
-
-                        if event.code == 3:
-                            button_str = "2"
-
+                        button_str = hardware_button_map.get(event.code, trinity_map.get(event.code))
                         if button_str and button_str in bindings:
                             target_action = bindings[button_str]
                             if target_action:
-                                if event.value == 1:
-                                    self.send_combo(d_xlib, target_action, True)
-                                elif event.value == 0:
-                                    self.send_combo(d_xlib, target_action, False)
-                            continue
-        except Exception as e:
-            logger.error(f"Exception encountered in input event loop: {e}")
+                                self.send_combo_uinput(target_action, event.value == 1)
+        except Exception as err:
+            logger.error(f"Exception in input loop: {err}")
         finally:
             try:
-                if d_xlib:
-                    d_xlib.close()
                 mouse_dev.ungrab()
-                logger.info("Released device grab and closed Xlib backend cleanly.")
-            except Exception as e:
-                logger.debug(f"Error during cleanup: {e}")
+            except Exception:
+                pass
+            if self.uinput:
+                self.uinput.close()
+
+def ensure_device_drivers():
+    try:
+        for hid_path in glob.glob("/sys/bus/hid/devices/0003:1532:*"):
+            device_id = os.path.basename(hid_path)
+            driver_link = os.path.join(hid_path, "driver")
+            if os.path.lexists(driver_link):
+                current_driver = os.path.basename(os.readlink(driver_link))
+                if current_driver in {"hid-generic", "hid"}:
+                    logger.info(f"Device {device_id} is bound to '{current_driver}'. Invoking helper...")
+                    subprocess.run(
+                        ["pkexec", "/usr/lib/openchroma/openchroma-helper", device_id, "razerkbd"],
+                        check=False
+                    )
+    except Exception as e:
+        logger.error(f"Failed to check/bind device drivers: {e}")
 
 # ==============================================================================
 # 4. MAIN GUI APPLICATION & SYNAPSE CONTROL PANEL
 # ==============================================================================
 class NagaSynapseApp(QWidget):
+    def load_profiles(self):
+        default_blueprints = {
+            "Default Profile": {"bindings": {}, "dpi": 1800, "aliases": ["default"]}, 
+            "ffxiv": {"bindings": {"1": "Ctrl+1"}, "dpi": 3600, "aliases": ["ffxivgame.x64", "ffxiv.exe", "ffxiv", "final fantasy xiv", "final fantasy 14"]}, 
+            "PSO2 NGS": {"bindings": {"1": "X", "2": "Shift", "3": "Middle Click", "4": "4", "5": "5", "6": "6", "7": "7", "8": "8", "9": "9", "10": "0", "11": "-", "12": "="}, "dpi": 4800, "aliases": ["pso2.exe", "pso2_bin/pso2.exe", "phantasy star online 2 new genesis", "new genesis"]}
+        }
+        if os.path.exists(PROFILE_FILE):
+            try:
+                with open(PROFILE_FILE, 'r') as f:
+                    data = json.load(f)
+                    for k, v in data.items():
+                        if isinstance(v, dict):
+                            if "bindings" not in v:
+                                data[k] = {"bindings": v, "dpi": 1800}
+                            
+                            base = k.lower().replace(" ", "")
+                            if "pso2" in base:
+                                data[k]["aliases"] = ["pso2.exe", "pso2_bin/pso2.exe", "phantasy star online 2 new genesis", "new genesis"]
+                            elif "ffxiv" in base or "finalfantasy" in base:
+                                data[k]["aliases"] = ["ffxivgame.x64", "ffxiv.exe", "ffxiv", "final fantasy xiv", "final fantasy 14"]
+                            elif "aliases" not in data[k]:
+                                data[k]["aliases"] = [base + ".exe", base, k.lower()]
+                    return data
+            except Exception as e:
+                logger.error(f"Failed to load profiles from disk: {e}")
+        return default_blueprints
+
     def __init__(self):
         super().__init__()
         self.setProperty("class", "openchroma")
@@ -436,7 +457,6 @@ class NagaSynapseApp(QWidget):
         self.saved_geometry = None
         
         self.shutdown_event = threading.Event()
-        
         self.profiles = self.load_profiles()
         self.razer = RazerBackend()
         self.is_mmo_mouse = self.detect_mmo_mouse()
@@ -467,7 +487,6 @@ class NagaSynapseApp(QWidget):
 
         self.dpi_stages = [300, 800, 1800, 3200, 4800, 6400, 7600, 9200, 12000]
         self.current_dpi_index = 2
-
         self.osd = DpiOsdOverlay()
 
         self.master_breathe_timer = QTimer(self)
@@ -475,7 +494,6 @@ class NagaSynapseApp(QWidget):
         self.master_breathe_timer.start(40)
 
         self.profile_dropdowns = []
-
         self.initUI()
         self.update_detected_hardware_labels()
         self.change_profile(0)
@@ -496,8 +514,7 @@ class NagaSynapseApp(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        icon_path = os.path.join(script_dir, "assets", "OpenChroma.png")
+        icon_path = get_asset_path("OpenChroma.png")
         if os.path.exists(icon_path) and self.windowHandle():
             self.windowHandle().setIcon(QIcon(icon_path))
 
@@ -509,24 +526,21 @@ class NagaSynapseApp(QWidget):
     def closeEvent(self, event):
         logger.info("Initiating clean shutdown for OpenChroma...")
         self.shutdown_event.set()
-        
         self.switcher.join(timeout=1.0)
         self.input_daemon.join(timeout=1.0)
-        
         event.accept()
 
     def detect_mmo_mouse(self):
         if self.razer.is_mmo_mouse():
             logger.info(f"Detected MMO mouse: {self.razer.name('mouse')}")
             return True
-        logger.warning("No Naga detected via openrazer; defaulting to standard 2-button layout.")
+        logger.warning("No Naga detected via openrazer; defaulting to standard layout.")
         return False
 
     def _apply_hw_dpi(self, dpi):
-        """Send DPI to the mouse only when it changed (the slider fires many events)."""
         if getattr(self, "_last_hw_dpi", None) != dpi and self.razer.set_dpi(dpi):
             self._last_hw_dpi = dpi
-            
+
     def set_exact_dpi_preset(self, target_dpi, trigger_osd=False):
         self.dpi_slider.blockSignals(True)
         self.dpi_slider.setValue(target_dpi)
@@ -546,16 +560,15 @@ class NagaSynapseApp(QWidget):
         self._apply_hw_dpi(target_dpi)
         if trigger_osd:
             self.osd.show_dpi(target_dpi)
-            
+
     def on_dpi_slider_changed(self, value):
         closest_dpi = min(self.dpi_stages, key=lambda x: abs(x - value))
         self.set_exact_dpi_preset(closest_dpi, trigger_osd=False)
 
     def initUI(self):
-        self.setWindowTitle('OpenChroma Controls (Universal X11 - 1.0.4)')
+        self.setWindowTitle('OpenChroma Controls (Universal - 1.0.6)')
         
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        icon_path = os.path.join(script_dir, "assets", "OpenChroma.png")
+        icon_path = get_asset_path("OpenChroma.png")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
@@ -585,12 +598,12 @@ class NagaSynapseApp(QWidget):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
+        # Device info card
         self.device_info_card = QFrame()
         self.device_info_card.setObjectName("CardFrame")
         info_layout = QHBoxLayout(self.device_info_card)
         info_layout.setContentsMargins(15, 10, 15, 10)
         
-        # --- Keyboard Icon & Label ---
         self.keyboard_icon_lbl = QLabel()
         self.keyboard_icon_lbl.setFixedSize(50, 30)
         self.keyboard_icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -600,12 +613,10 @@ class NagaSynapseApp(QWidget):
         self.keyboard_lbl.setStyleSheet("color: #00ff00; font-size: 12px;")
         info_layout.addWidget(self.keyboard_lbl)
         
-        # --- Separator ---
         separator = QLabel("  |  ")
         separator.setStyleSheet("color: #888888; font-size: 12px;")
         info_layout.addWidget(separator)
         
-        # --- Mouse Icon & Label ---
         self.mouse_icon_lbl = QLabel()
         self.mouse_icon_lbl.setFixedSize(50, 30)
         self.mouse_icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -616,11 +627,11 @@ class NagaSynapseApp(QWidget):
         info_layout.addWidget(self.mouse_lbl)
         
         info_layout.addStretch()
-        
         main_layout.addWidget(self.device_info_card)
 
         self.tabs = QTabWidget()
         
+        # Customize Tab
         customize_tab = QWidget()
         customize_layout = QHBoxLayout(customize_tab)
         customize_layout.setContentsMargins(20, 20, 20, 20)
@@ -697,6 +708,7 @@ class NagaSynapseApp(QWidget):
 
         customize_layout.addWidget(left_card, stretch=2)
 
+        # Right Panel - Keybindings & Mouse Functions
         right_card = QFrame()
         right_card.setObjectName("CardFrame")
         right_card_layout = QVBoxLayout(right_card)
@@ -736,16 +748,18 @@ class NagaSynapseApp(QWidget):
         customize_layout.addWidget(right_card, stretch=1)
 
         self.tabs.addTab(customize_tab, "CUSTOMIZE")
-        
+
+        # Performance Tab
         perf_tab = self.build_performance_tab()
         self.tabs.addTab(perf_tab, "PERFORMANCE")
 
+        # Lighting Tab
         light_tab = self.build_lighting_tab()
         self.tabs.addTab(light_tab, "LIGHTING")
 
         main_layout.addWidget(self.tabs)
 
-        # --- Bottom Right Footer Layout ---
+        # --- Footer Layout (Autostart Checkbox) ---
         footer_layout = QHBoxLayout()
         footer_layout.setContentsMargins(15, 0, 15, 8)
         footer_layout.addStretch()
@@ -767,11 +781,10 @@ class NagaSynapseApp(QWidget):
                 background: #00FF66;
             }
         """)
-        self.autostart_chk.stateChanged.connect(self.toggle_autostart)
+        self.autostart_chk.toggled.connect(self.toggle_autostart)
         footer_layout.addWidget(self.autostart_chk)
         
         main_layout.addLayout(footer_layout)
-
         self.setLayout(main_layout)
         self.setFixedSize(980, 600)
 
@@ -792,12 +805,10 @@ class NagaSynapseApp(QWidget):
         self.tray_menu.addAction(self.show_action)
         
         self.tray_menu.addSeparator()
-        
         self.tray_profile_menu = self.tray_menu.addMenu("Switch Game Profile")
         self.update_tray_profile_menu()
         
         self.tray_menu.addSeparator()
-        
         self.quit_action = QAction("Quit Program", self)
         self.quit_action.triggered.connect(QApplication.instance().quit)
         self.tray_menu.addAction(self.quit_action)
@@ -831,172 +842,43 @@ class NagaSynapseApp(QWidget):
                     self.setGeometry(self.saved_geometry)
                 self.activateWindow()
 
-    def get_autostart_path(self):
-        return os.path.expanduser("~/.config/autostart/openchroma.desktop")
+    def get_autostart_path(self) -> Path:
+        return Path.home() / ".config" / "autostart" / "openchroma.desktop"
 
-    def check_autostart_status(self):
-        return os.path.exists(self.get_autostart_path())
+    def check_autostart_status(self) -> bool:
+        return self.get_autostart_path().exists()
 
-    def toggle_autostart(self, state):
-        desktop_path = self.get_autostart_path()
-        if state == 2:
-            os.makedirs(os.path.dirname(desktop_path), exist_ok=True)
-            script_path = os.path.abspath(__file__)
-            desktop_content = f"""[Desktop Entry]
+    def toggle_autostart(self, checked: bool):
+        desktop_file = self.get_autostart_path()
+        autostart_dir = desktop_file.parent
+
+        if checked:
+            try:
+                autostart_dir.mkdir(parents=True, exist_ok=True)
+                python_executable = sys.executable
+                app_script = os.path.abspath(sys.argv[0])
+                
+                desktop_content = f"""[Desktop Entry]
 Type=Application
 Name=OpenChroma
-Exec=python3 {script_path}
-Hidden=false
-NoDisplay=false
+Comment=Razer RGB Device & Profile Manager
+Exec={python_executable} {app_script}
+Terminal=false
 X-GNOME-Autostart-enabled=true
 """
-            with open(desktop_path, "w") as f:
-                f.write(desktop_content)
-            logger.info("Created autostart configuration.")
+                desktop_file.write_text(desktop_content.strip())
+                logger.info(f"Created autostart entry at {desktop_file}")
+            except Exception as e:
+                logger.error(f"Failed to create autostart desktop entry: {e}")
+                QMessageBox.critical(self, "Error", f"Could not create autostart entry: {e}")
         else:
-            if os.path.exists(desktop_path):
-                os.remove(desktop_path)
-                logger.info("Removed autostart configuration.")
-
-    def get_profile_names(self):
-        return list(self.profiles.keys())
-
-    def get_active_profile_name(self):
-        if self.profile_dropdowns:
-            return self.profile_dropdowns[0].currentText()
-        return "Default Profile"
-
-    def sync_all_profile_dropdowns(self, profile_name):
-        for combo in self.profile_dropdowns:
-            combo.blockSignals(True)
-            combo.setCurrentText(profile_name)
-            combo.blockSignals(False)
-        self.update_tray_profile_menu()
-
-    def handle_dropdown_profile_change(self, index):
-        sender_combo = self.sender()
-        if sender_combo:
-            prof_name = sender_combo.currentText()
-            self.sync_all_profile_dropdowns(prof_name)
-            self.change_profile(0)
-
-    def register_active_alias(self, profile_name, new_identifier):
-        if not new_identifier or profile_name not in self.profiles:
-            return False
-
-        profile_data = self.profiles[profile_name]
-        if not isinstance(profile_data, dict):
-            return False
-
-        aliases = profile_data.setdefault("aliases", [])
-        normalized_aliases = [a.lower().strip() for a in aliases]
-        clean_id = new_identifier.lower().strip()
-
-        if clean_id not in normalized_aliases:
-            aliases.append(clean_id)
-            self.save_profiles_to_disk_silent()
-            logger.info(f"Auto-registered new alias '{clean_id}' for profile '{profile_name}'")
-            return True
-        return False
-
-    def save_profiles_to_disk_silent(self):
-        try:
-            os.makedirs(os.path.dirname(PROFILE_FILE), exist_ok=True)
-            with open(PROFILE_FILE, 'w') as f:
-                json.dump(self.profiles, f, indent=4)
-        except Exception as e:
-            logger.error(f"Failed to save profiles quietly: {e}")
-
-    def handle_auto_window_switch(self, window_info):
-        win_id, class_tokens, window_title = window_info
-        matched_profile = None
-        matched_token = None
-
-        for p in self.profiles.keys():
-            p_lower = p.lower()
-            prof_data = self.profiles[p]
-            aliases = prof_data.get("aliases", []) if isinstance(prof_data, dict) else []
-            if not aliases:
-                aliases = [p_lower.replace(" ", "") + ".exe", p_lower]
-            
-            match_found = any(any(alias.lower() in token for token in class_tokens) for alias in aliases) or \
-                          any(alias.lower() in window_title for alias in aliases)
-            
-            if not match_found and "pso2" in p_lower and ("pso2" in window_title or any("pso2" in t for t in class_tokens)):
-                match_found = True
-
-            if match_found:
-                matched_profile = p
-                break
-
-        if not matched_profile:
-            for token in class_tokens:
-                if token.startswith("steam_app_"):
-                    current_selected = self.get_active_profile_name()
-                    if current_selected != "Default Profile":
-                        matched_profile = current_selected
-                        matched_token = token
-                        break
-
-        if matched_profile:
-            current_selected = self.get_active_profile_name()
-            if current_selected != matched_profile:
-                self.sync_all_profile_dropdowns(matched_profile)
-                self.change_profile(0)
-            
-            if matched_token:
-                self.register_active_alias(matched_profile, matched_token)
-            elif window_title and len(window_title) > 3:
-                if matched_profile != "Default Profile":
-                    self.register_active_alias(matched_profile, window_title)
-
-    def update_detected_hardware_labels(self):
-        import html
-        kb_name = self.razer.name('keyboard')
-        mouse_name = self.razer.name('mouse')
-        
-        # Update text labels
-        self.keyboard_lbl.setText(f"<b>Keyboard:</b> {html.escape(kb_name)}")
-        
-        mouse_text = f"<b>Mouse:</b> {html.escape(mouse_name)}"
-        if self.razer.error:
-            mouse_text += f" &nbsp;&nbsp;|&nbsp;&nbsp; <span style='color:#ff6666;'>{html.escape(self.razer.error)}</span>"
-        self.mouse_lbl.setText(mouse_text)
-
-        # --- Load and Display Keyboard Icon ---
-        # Pass "keyboard_default" as the fallback parameter
-        kb_image_path = get_cached_device_image(kb_name, None, fallback="keyboard_default")
-        if kb_image_path and os.path.exists(kb_image_path):
-            kb_pixmap = QPixmap(kb_image_path).scaled(
-                50, 30, 
-                Qt.AspectRatioMode.KeepAspectRatio, 
-                Qt.TransformationMode.SmoothTransformation
-            )
-            self.keyboard_icon_lbl.setPixmap(kb_pixmap)
-        else:
-            self.keyboard_icon_lbl.clear()
-
-        # --- Load and Display Mouse Icon ---
-        # Pass "mouse_default" as the fallback parameter
-        mouse_image_path = get_cached_device_image(mouse_name, None, fallback="mouse_default")
-        if mouse_image_path and os.path.exists(mouse_image_path):
-            mouse_pixmap = QPixmap(mouse_image_path).scaled(
-                50, 30, 
-                Qt.AspectRatioMode.KeepAspectRatio, 
-                Qt.TransformationMode.SmoothTransformation
-            )
-            self.mouse_icon_lbl.setPixmap(mouse_pixmap)
-        else:
-            self.mouse_icon_lbl.clear()
-
-    def set_panel_view(self, panel_type):
-        self.current_active_panel = panel_type
-        for k, btn in self.thumb_buttons.items():
-            if k == panel_type:
-                btn.setStyleSheet("QPushButton { background-color: #1e1e1e; color: #00ff00; border: 2px solid #00ff00; font-weight: bold; border-radius: 6px; }")
-            else:
-                btn.setStyleSheet("QPushButton { background-color: #222222; color: #888888; border: 1px solid #3a3a3a; font-weight: bold; border-radius: 6px; } QPushButton:hover { border: 1px solid #00ff00; color: #ffffff; }")
-        self.update_ui_layout(panel_type)
+            if desktop_file.exists():
+                try:
+                    desktop_file.unlink()
+                    logger.info("Removed autostart entry.")
+                except Exception as e:
+                    logger.error(f"Failed to remove autostart desktop entry: {e}")
+                    QMessageBox.critical(self, "Error", f"Could not remove autostart entry: {e}")
 
     def build_performance_tab(self):
         tab = QWidget()
@@ -1006,9 +888,11 @@ X-GNOME-Autostart-enabled=true
         card = QFrame()
         card.setObjectName("CardFrame")
         card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(15, 15, 15, 15)
 
         p_bar = QHBoxLayout()
         prof_select_perf = QComboBox()
+        prof_select_perf.setFixedWidth(180)
         prof_select_perf.addItems(self.get_profile_names())
         prof_select_perf.currentIndexChanged.connect(self.handle_dropdown_profile_change)
         self.profile_dropdowns.append(prof_select_perf)
@@ -1018,54 +902,92 @@ X-GNOME-Autostart-enabled=true
         p_bar.addStretch()
         
         save_perf_btn = QPushButton("SAVE & APPLY")
-        save_perf_btn.setStyleSheet("background-color: #00ff00; color: #000000; font-weight: bold; border: none; padding: 5px 12px;")
+        save_perf_btn.setStyleSheet("background-color: #00ff00; color: #000000; font-weight: bold; border: none; padding: 6px 16px; border-radius: 4px;")
         save_perf_btn.clicked.connect(self.save_to_disk)
         p_bar.addWidget(save_perf_btn)
         
         card_layout.addLayout(p_bar)
-        card_layout.addSpacing(10)
+        card_layout.addSpacing(15)
 
-        card_layout.addWidget(QLabel("<b style='color: #00ff00; font-size: 15px;'>SENSITIVITY (DPI)</b>"))
+        dpi_header_banner = QLabel("  SENSITIVITY (DPI)")
+        dpi_header_banner.setStyleSheet("background-color: #141414; color: #00ff00; font-weight: bold; font-size: 13px; padding: 6px 4px; border-radius: 3px;")
+        card_layout.addWidget(dpi_header_banner)
+        card_layout.addSpacing(10)
         
-        self.dpi_label = QLabel("Current DPI: <b>1800</b> (Preset Stage)")
-        self.dpi_label.setStyleSheet("font-size: 14px; margin-top: 10px;")
+        self.dpi_label = QLabel("Current DPI: <b>1800</b> (Profile Preset)")
+        self.dpi_label.setStyleSheet("font-size: 13px; margin-left: 5px;")
         card_layout.addWidget(self.dpi_label)
+        card_layout.addSpacing(5)
 
         self.dpi_slider = QSlider(Qt.Orientation.Horizontal)
         self.dpi_slider.setMinimum(300)
         self.dpi_slider.setMaximum(12000)
-        self.dpi_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.dpi_slider.setTickInterval(1000)
         self.dpi_slider.setValue(1800)
-        
+        self.dpi_slider.setStyleSheet("""
+            QSlider::groove:horizontal { height: 6px; background: #222222; border-radius: 3px; }
+            QSlider::sub-page:horizontal { background: #00ff00; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #ffffff; width: 14px; margin-top: -4px; margin-bottom: -4px; border-radius: 7px; }
+        """)
         self.dpi_slider.sliderMoved.connect(self.snap_dpi_slider)
         self.dpi_slider.sliderReleased.connect(self.finalize_snap_dpi)
         self.dpi_slider.valueChanged.connect(self.on_dpi_slider_changed)
         card_layout.addWidget(self.dpi_slider)
 
-        card_layout.addSpacing(5)
+        card_layout.addSpacing(10)
         card_layout.addWidget(QLabel("<b>DPI Presets:</b>"))
+        card_layout.addSpacing(5)
+        
         stage_layout = QHBoxLayout()
+        stage_layout.setSpacing(12)
         for stage_dpi in self.dpi_stages:
             btn = QPushButton(f"{stage_dpi}")
-            btn.setFixedWidth(58)
+            btn.setFixedHeight(35)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #222222;
+                    border: 1px solid #333333;
+                    border-radius: 4px;
+                    color: #ffffff;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    border: 1px solid #00ff00;
+                    background-color: #2a2a2a;
+                }
+            """)
             btn.clicked.connect(lambda checked, d=stage_dpi: self.set_exact_dpi_preset(d, trigger_osd=True))
             stage_layout.addWidget(btn)
         card_layout.addLayout(stage_layout)
 
         card_layout.addSpacing(15)
-        info_box = QFrame()
-        info_box.setStyleSheet("background-color: #142814; border: 1px solid #00ff00; border-radius: 5px; padding: 10px;")
-        info_layout = QVBoxLayout(info_box)
-        info_layout.setContentsMargins(10, 10, 10, 10)
-        info_layout.addWidget(QLabel("<b>Per-Profile DPI:</b> DPI stages now automatically save and load based on your active game profile."))
-        card_layout.addWidget(info_box)
-
-        card_layout.addSpacing(20)
-        card_layout.addWidget(QLabel("<b style='color: #00ff00; font-size: 15px;'>POLLING RATE</b>"))
         
+        outer_info_box = QFrame()
+        outer_info_box.setStyleSheet("background-color: #121f12; border: 1px solid #00ff00; border-radius: 6px;")
+        outer_layout = QVBoxLayout(outer_info_box)
+        outer_layout.setContentsMargins(8, 8, 8, 8)
+
+        inner_info_box = QFrame()
+        inner_info_box.setStyleSheet("border: 1px solid #00ff00; border-radius: 4px; background-color: transparent;")
+        inner_layout = QVBoxLayout(inner_info_box)
+        inner_layout.setContentsMargins(15, 12, 15, 12)
+
+        info_text = QLabel("<b>Per-Profile DPI:</b> DPI stages now automatically save and load based on your active game profile.")
+        info_text.setStyleSheet("border: none; color: #ffffff; font-size: 12px;")
+        inner_layout.addWidget(info_text)
+
+        outer_layout.addWidget(inner_info_box)
+        card_layout.addWidget(outer_info_box)
+
+        card_layout.addSpacing(15)
+
+        poll_header_banner = QLabel("  POLLING RATE")
+        poll_header_banner.setStyleSheet("background-color: #141414; color: #00ff00; font-weight: bold; font-size: 13px; padding: 6px 4px; border-radius: 3px;")
+        card_layout.addWidget(poll_header_banner)
+        card_layout.addSpacing(10)
+
         polling_layout = QHBoxLayout()
         self.poll_combo = QComboBox()
+        self.poll_combo.setFixedWidth(120)
         rates = [f"{r} Hz" for r in self.razer.supported_poll_rates()]
         self.poll_combo.addItems(rates)
         current_rate = self.razer.get_poll_rate()
@@ -1087,7 +1009,7 @@ X-GNOME-Autostart-enabled=true
         self.dpi_slider.blockSignals(True)
         self.dpi_slider.setValue(closest_dpi)
         self.dpi_slider.blockSignals(False)
-        self.dpi_label.setText(f"Current DPI: <b>{closest_dpi}</b> (Stage Snap)")
+        self.dpi_label.setText(f"Current DPI: <b>{closest_dpi}</b> (Profile Preset)")
 
     def finalize_snap_dpi(self):
         current_val = self.dpi_slider.value()
@@ -1351,7 +1273,6 @@ X-GNOME-Autostart-enabled=true
         is_breathe = (effect_name == "Breathe")
 
         if self.current_target == "mouse" and is_breathe:
-            # The Naga Trinity only exposes static lighting
             self.effect_combo.blockSignals(True)
             self.effect_combo.setCurrentText("Static (Custom Color)")
             self.effect_combo.blockSignals(False)
@@ -1425,6 +1346,34 @@ X-GNOME-Autostart-enabled=true
             selected_func = self.mouse_func_combo.currentText()
             self.key_input.setText(selected_func)
             self.save_current_binding()
+
+    def update_detected_hardware_labels(self):
+        import html
+        kb_name = self.razer.name('keyboard')
+        mouse_name = self.razer.name('mouse')
+        
+        self.keyboard_lbl.setText(f"<b>Keyboard:</b> {html.escape(kb_name)}")
+        mouse_text = f"<b>Mouse:</b> {html.escape(mouse_name)}"
+        if self.razer.error:
+            mouse_text += f" &nbsp;&nbsp;|&nbsp;&nbsp; <span style='color:#ff6666;'>{html.escape(self.razer.error)}</span>"
+        self.mouse_lbl.setText(mouse_text)
+
+        kb_image_path = get_cached_device_image(kb_name, None, fallback="keyboard_default")
+        if kb_image_path and os.path.exists(kb_image_path):
+            self.keyboard_icon_lbl.setPixmap(QPixmap(kb_image_path).scaled(50, 30, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+        mouse_image_path = get_cached_device_image(mouse_name, None, fallback="mouse_default")
+        if mouse_image_path and os.path.exists(mouse_image_path):
+            self.mouse_icon_lbl.setPixmap(QPixmap(mouse_image_path).scaled(50, 30, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def set_panel_view(self, panel_type):
+        self.current_active_panel = panel_type
+        for k, btn in self.thumb_buttons.items():
+            if k == panel_type:
+                btn.setStyleSheet("QPushButton { background-color: #1e1e1e; color: #00ff00; border: 2px solid #00ff00; font-weight: bold; border-radius: 6px; }")
+            else:
+                btn.setStyleSheet("QPushButton { background-color: #222222; color: #888888; border: 1px solid #3a3a3a; font-weight: bold; border-radius: 6px; } QPushButton:hover { border: 1px solid #00ff00; color: #ffffff; }")
+        self.update_ui_layout(panel_type)
 
     def update_ui_layout(self, panel_type):
         while self.container_layout.count():
@@ -1663,7 +1612,6 @@ X-GNOME-Autostart-enabled=true
 
             if not is_modifier_key and not (len(combo_parts) > 0 and key in [16777249, 16777248]):
                 is_numpad = bool(modifiers & Qt.KeyboardModifier.KeypadModifier)
-                
                 scancode_num_map = {10: "1", 11: "2", 12: "3", 13: "4", 14: "5", 15: "6", 16: "7", 17: "8", 18: "9", 19: "0"}
                 if scancode in scancode_num_map and not is_numpad:
                     combo_parts.append(scancode_num_map[scancode])
@@ -1701,32 +1649,97 @@ X-GNOME-Autostart-enabled=true
         else:
             self.record_btn.setText("Record Keyboard Function")
 
-    def load_profiles(self):
-        default_blueprints = {
-            "Default Profile": {"bindings": {}, "dpi": 1800, "aliases": ["default"]}, 
-            "ffxiv": {"bindings": {"1": "Ctrl+1"}, "dpi": 3600, "aliases": ["ffxivgame.x64", "ffxiv.exe", "ffxiv", "final fantasy xiv", "final fantasy 14"]}, 
-            "PSO2 NGS": {"bindings": {"1": "X", "2": "Shift", "3": "Middle Click", "4": "4", "5": "5", "6": "6", "7": "7", "8": "8", "9": "9", "10": "0", "11": "-", "12": "="}, "dpi": 4800, "aliases": ["pso2.exe", "pso2_bin/pso2.exe", "phantasy star online 2 new genesis", "new genesis"]}
-        }
-        if os.path.exists(PROFILE_FILE):
-            try:
-                with open(PROFILE_FILE, 'r') as f:
-                    data = json.load(f)
-                    for k, v in data.items():
-                        if isinstance(v, dict):
-                            if "bindings" not in v:
-                                data[k] = {"bindings": v, "dpi": 1800}
-                            
-                            base = k.lower().replace(" ", "")
-                            if "pso2" in base:
-                                data[k]["aliases"] = ["pso2.exe", "pso2_bin/pso2.exe", "phantasy star online 2 new genesis", "new genesis"]
-                            elif "ffxiv" in base or "finalfantasy" in base:
-                                data[k]["aliases"] = ["ffxivgame.x64", "ffxiv.exe", "ffxiv", "final fantasy xiv", "final fantasy 14"]
-                            elif "aliases" not in data[k]:
-                                data[k]["aliases"] = [base + ".exe", base, k.lower()]
-                    return data
-            except Exception as e:
-                logger.error(f"Failed to load profiles from disk: {e}")
-        return default_blueprints
+    def get_profile_names(self):
+        return list(self.profiles.keys())
+
+    def get_active_profile_name(self):
+        if self.profile_dropdowns:
+            return self.profile_dropdowns[0].currentText()
+        return "Default Profile"
+
+    def sync_all_profile_dropdowns(self, profile_name):
+        for combo in self.profile_dropdowns:
+            combo.blockSignals(True)
+            combo.setCurrentText(profile_name)
+            combo.blockSignals(False)
+        self.update_tray_profile_menu()
+
+    def handle_dropdown_profile_change(self, index):
+        sender_combo = self.sender()
+        if sender_combo:
+            prof_name = sender_combo.currentText()
+            self.sync_all_profile_dropdowns(prof_name)
+            self.change_profile(0)
+
+    def register_active_alias(self, profile_name, new_identifier):
+        if not new_identifier or profile_name not in self.profiles:
+            return False
+
+        profile_data = self.profiles[profile_name]
+        if not isinstance(profile_data, dict):
+            return False
+
+        aliases = profile_data.setdefault("aliases", [])
+        normalized_aliases = [a.lower().strip() for a in aliases]
+        clean_id = new_identifier.lower().strip()
+
+        if clean_id not in normalized_aliases:
+            aliases.append(clean_id)
+            self.save_profiles_to_disk_silent()
+            logger.info(f"Auto-registered new alias '{clean_id}' for profile '{profile_name}'")
+            return True
+        return False
+
+    def save_profiles_to_disk_silent(self):
+        try:
+            os.makedirs(os.path.dirname(PROFILE_FILE), exist_ok=True)
+            with open(PROFILE_FILE, 'w') as f:
+                json.dump(self.profiles, f, indent=4)
+        except Exception as e:
+            logger.error(f"Failed to save profiles quietly: {e}")
+
+    def handle_auto_window_switch(self, window_info):
+        win_id, class_tokens, window_title = window_info
+        matched_profile = None
+        matched_token = None
+
+        for p in self.profiles.keys():
+            p_lower = p.lower()
+            prof_data = self.profiles[p]
+            aliases = prof_data.get("aliases", []) if isinstance(prof_data, dict) else []
+            if not aliases:
+                aliases = [p_lower.replace(" ", "") + ".exe", p_lower]
+            
+            match_found = any(any(alias.lower() in token for token in class_tokens) for alias in aliases) or \
+                          any(alias.lower() in window_title for alias in aliases)
+            
+            if not match_found and "pso2" in p_lower and ("pso2" in window_title or any("pso2" in t for t in class_tokens)):
+                match_found = True
+
+            if match_found:
+                matched_profile = p
+                break
+
+        if not matched_profile:
+            for token in class_tokens:
+                if token.startswith("steam_app_"):
+                    current_selected = self.get_active_profile_name()
+                    if current_selected != "Default Profile":
+                        matched_profile = current_selected
+                        matched_token = token
+                        break
+
+        if matched_profile:
+            current_selected = self.get_active_profile_name()
+            if current_selected != matched_profile:
+                self.sync_all_profile_dropdowns(matched_profile)
+                self.change_profile(0)
+            
+            if matched_token:
+                self.register_active_alias(matched_profile, matched_token)
+            elif window_title and len(window_title) > 3:
+                if matched_profile != "Default Profile":
+                    self.register_active_alias(matched_profile, window_title)
 
     def save_to_disk(self):
         self.save_current_binding()
@@ -1747,7 +1760,7 @@ X-GNOME-Autostart-enabled=true
         self.update_button_visuals()
         self.update_tray_profile_menu()
         QMessageBox.information(self, "Success", "Layout profiles and DPI settings successfully updated.")
-        
+
     def change_profile(self, index):
         profile_name = self.get_active_profile_name()
         if not profile_name: return
@@ -1859,12 +1872,22 @@ X-GNOME-Autostart-enabled=true
                 QMessageBox.critical(self, "Error", f"Failed to import profiles: {e}")
 
 if __name__ == '__main__':
-    QApplication.setDesktopFileName("open_chroma")
+    ensure_device_drivers()  # Check and bind drivers first
+    
+    # Dynamic session check: Native Wayland on Wayland sessions, fallback to xcb on X11
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    if session_type == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+        if "XDG_RUNTIME_DIR" not in os.environ:
+            os.environ["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+        os.environ["QT_QPA_PLATFORM"] = "wayland"
+    else:
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
     
     app = QApplication(sys.argv)
+    app.setApplicationName("OpenChroma")
+    app.setDesktopFileName("openchroma")
     
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    icon_path = os.path.join(script_dir, "assets", "OpenChroma.png")
+    icon_path = get_asset_path("OpenChroma.png")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
         

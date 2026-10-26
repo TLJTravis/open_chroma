@@ -3,57 +3,52 @@
 # Exit immediately if any command fails
 set -e
 
-echo "Fetching the latest release of OpenChroma..."
+echo "Installing OpenChroma (Wayland Version) and system dependencies..."
 
-REPO="TLJTravis/open_chroma"
+# 1. Install required system and Python dependencies via apt
+sudo apt update
+sudo apt install -y python3-pyqt6 python3-evdev python3-dbus xdotool openrazer-meta
+
+# Ensure user has access to hardware devices
+sudo gpasswd -a "$USER" plugdev || true
+
+# 2. Setup local application directories
 SHARE_DIR="$HOME/.local/share/openchroma"
 INSTALL_DIR="$HOME/.local/bin"
 DESKTOP_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 
-mkdir -p "$SHARE_DIR"
+mkdir -p "$SHARE_DIR/assets"
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$DESKTOP_DIR"
 mkdir -p "$ICON_DIR"
 
-# Get direct download URLs
-DOWNLOAD_URL=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep "browser_download_url" | grep -v "\.sha256" | cut -d '"' -f 4 | head -n 1)
-CHECKSUM_URL=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep "browser_download_url" | grep "\.sha256" | cut -d '"' -f 4 | head -n 1)
-
-if [ -z "$DOWNLOAD_URL" ] || [ -z "$CHECKSUM_URL" ]; then
-    echo "Error: Could not find the release binary or checksum file."
+# 3. Copy application files from the current repository workspace
+if [ -f "open_chroma_wayland.py" ]; then
+    cp "open_chroma_wayland.py" "$SHARE_DIR/open_chroma_wayland.py"
+    chmod +x "$SHARE_DIR/open_chroma_wayland.py"
+else
+    echo "Error: open_chroma_wayland.py not found in current directory."
     exit 1
 fi
 
-echo "Downloading OpenChroma and verification checksum..."
-curl -L -o "$SHARE_DIR/open_chroma.py" "$DOWNLOAD_URL"
-curl -L -o "$SHARE_DIR/open_chroma.sha256" "$CHECKSUM_URL"
-
-# Verify the checksum
-echo "Verifying file integrity..."
-cd "$SHARE_DIR"
-if ! sha256sum -c open_chroma.sha256 --status; then
-    echo "Error: Checksum verification failed! The downloaded file may be corrupted."
-    rm -f open_chroma.py open_chroma.sha256
+if [ -f "razer_backend.py" ]; then
+    cp "razer_backend.py" "$SHARE_DIR/razer_backend.py"
+else
+    echo "Error: razer_backend.py not found in current directory."
     exit 1
 fi
 
-# Clean up checksum and set permissions
-rm -f open_chroma.sha256
-chmod +x "$SHARE_DIR/open_chroma.py"
-
-# Ensure assets folder exists alongside the script in the share directory
-mkdir -p "$SHARE_DIR/assets"
 if [ -f "assets/OpenChroma.png" ]; then
-    cp assets/OpenChroma.png "$SHARE_DIR/assets/OpenChroma.png"
+    cp "assets/OpenChroma.png" "$SHARE_DIR/assets/OpenChroma.png"
 fi
 
-# Create a symlink in PATH so users can type 'openchroma' anywhere
-ln -sf "$SHARE_DIR/open_chroma.py" "$INSTALL_DIR/openchroma"
+# 4. Create a symlink in PATH so users can type 'openchroma' anywhere
+ln -sf "$SHARE_DIR/open_chroma_wayland.py" "$INSTALL_DIR/openchroma"
 
-# Install desktop file and system tray icon if available
+# 5. Install desktop file and icon if available
 if [ -f "open_chroma.desktop" ]; then
-    cp open_chroma.desktop "$DESKTOP_DIR/"
+    cp "open_chroma.desktop" "$DESKTOP_DIR/"
 fi
 
 if [ -f "$SHARE_DIR/assets/OpenChroma.png" ]; then
@@ -63,10 +58,14 @@ fi
 
 update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
 
-# Dynamically update the installed desktop file with the current user's absolute paths
+# Dynamically update the installed desktop file with absolute paths
 if [ -f "$DESKTOP_DIR/openchroma.desktop" ]; then
     sed -i "s|Exec=open_chroma|Exec=$INSTALL_DIR/openchroma|g" "$DESKTOP_DIR/openchroma.desktop"
     sed -i "s|Icon=openchroma|Icon=$ICON_DIR/OpenChroma.png|g" "$DESKTOP_DIR/openchroma.desktop"
 fi
 
-echo "Installation complete and verified! OpenChroma is ready to use."
+# 6. Enable and start the OpenRazer daemon user service
+systemctl --user daemon-reload
+systemctl --user enable --now openrazer-daemon.service || echo "Note: OpenRazer service will be active after logging back in."
+
+echo "Installation complete! OpenChroma is ready to use."

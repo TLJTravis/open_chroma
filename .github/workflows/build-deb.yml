@@ -1,0 +1,60 @@
+name: Build and Release DEB
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build Debian Package
+        run: |
+          # Create staging directory structure
+          PKG_DIR="openchroma_${{ github.ref_name }}_all"
+          mkdir -p "$PKG_DIR/DEBIAN"
+          mkdir -p "$PKG_DIR/usr/bin"
+          mkdir -p "$PKG_DIR/usr/share/openchroma/assets"
+          mkdir -p "$PKG_DIR/usr/share/applications"
+          mkdir -p "$PKG_DIR/usr/share/icons/hicolor/scalable/apps"
+
+          # Copy control file
+          cp debian/control "$PKG_DIR/DEBIAN/control"
+          
+          # Strip 'v' from version for dpkg if needed (or keep it clean)
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          sed -i "s/Version: .*/Version: $VERSION/" "$PKG_DIR/DEBIAN/control"
+
+          # Copy application files
+          cp open_chroma.py "$PKG_DIR/usr/share/openchroma/"
+          cp razer_backend.py "$PKG_DIR/usr/share/openchroma/"
+          cp assets/OpenChroma.png "$PKG_DIR/usr/share/openchroma/assets/"
+          cp open_chroma.desktop "$PKG_DIR/usr/share/applications/"
+          cp assets/OpenChroma.png "$PKG_DIR/usr/share/icons/hicolor/scalable/apps/OpenChroma.png"
+
+          # Create wrapper script in /usr/bin
+          cat << 'EOF' > "$PKG_DIR/usr/bin/openchroma"
+          #!/bin/bash
+          exec python3 /usr/share/openchroma/open_chroma.py "$@"
+          EOF
+          chmod +x "$PKG_DIR/usr/bin/openchroma"
+          chmod +x "$PKG_DIR/usr/share/openchroma/open_chroma.py"
+
+          # Build the .deb package
+          dpkg-deb --build "$PKG_DIR"
+          mv "${PKG_DIR}.deb" openchroma_${VERSION}_all.deb
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v1
+        with:
+          files: openchroma_*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
