@@ -1,13 +1,7 @@
-Source: openchroma
-Section: utils
-Priority: optional
-Maintainer: TJ Travis <tljtravis@gmail.com>
-Build-Depends: debhelper-compat (= 13), python3-setuptools
-Standards-Version: 4.6.2
-Homepage: https://github.com/TLJTravis/open_chroma
-
 Package: openchroma
+Version: 1.0.7
 Architecture: all
+Maintainer: TJ Travis <tljtravis@gmail.com>
 Depends: ${misc:Depends}, python3, python3-pyqt6, python3-evdev, python3-dbus, xdotool, openrazer-meta
 Description: Universal Razer peripheral management utility for Linux
  OpenChroma provides per-profile key remapping, dynamic window auto-profile
