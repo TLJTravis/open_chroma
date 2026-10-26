@@ -34,7 +34,7 @@ jobs:
           sed -i "s/Version: .*/Version: $VERSION/" "$PKG_DIR/DEBIAN/control"
 
           # Copy application files
-          cp open_chroma.py "$PKG_DIR/usr/share/openchroma/"
+          cp openchroma "$PKG_DIR/usr/share/openchroma/"
           cp razer_backend.py "$PKG_DIR/usr/share/openchroma/"
           cp assets/OpenChroma.png "$PKG_DIR/usr/share/openchroma/assets/"
           cp open_chroma.desktop "$PKG_DIR/usr/share/applications/"
