@@ -22,14 +22,13 @@ jobs:
             python3-evdev \
             python3-xlib \
             python3-dbus \
-            python3-openrgb \
             libdbus-1-dev \
             pkg-config \
             build-essential
 
       - name: Build Standalone Executable
         run: |
-          pip install pyinstaller --break-system-packages
+          pip install pyinstaller openrgb-python --break-system-packages
           pyinstaller --name openchroma --onefile --windowed --add-data "assets:assets" openchroma
 
       - name: Create Release and Upload Binary
