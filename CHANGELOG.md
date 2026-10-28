@@ -11,9 +11,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Planned
 - SHA-256 checksum verification during installation.
-- Improved OpenRazer device access validation and hardware detection.
 - Clean process signal handling (`SIGINT`/`SIGTERM`).
+---
 
+## Keyboard/Mouse editor US/UI upgrades & fixes for bugs in those modules - 2026-10-28
+
+### Added
+- **Keyboard Matrix Grid & Paint Canvas:** Implemented per-key 6x22 matrix RGB lighting editor, visual painting canvas, color gamut color picker, and real-time hardware flushing.
+- **Mouse Zone Customization UI & Backend:** Added interactive mouse zone selection (Scroll Wheel, Logo, Keypad) and guarded `set_mouse_zone` handling in `RazerBackend` to safely interface with OpenRazer mouse features while preventing `NoneType` crashes.
+- **OpenRGB Background Daemon Integration:** Integrated OpenRGB Flatpak installation and automatic autostart configuration (`openrgb-server.desktop`) into `install.sh` to handle low-level USB communication over SDK port 6742.
+
+### Fixed
+- **Keyboard Matrix Persistence:** Fixed profile saving logic so clicking "Clear All" and saving cleanly flushes empty matrix data from JSON profiles instead of retaining prior color states.
+- **Editor Initialization:** Resolved initial launch state so the editor starts up clean without pre-selecting or prematurely highlighting keys.
+- **Mouse Logo Highlight Alignment:** Adjusted `MouseZoneWidget` Y-coordinate positioning (fine-tuned to `85`) to ensure the interactive highlight box aligns cleanly over the Naga Trinity logo graphic.
+---
+## Keyboard Matrix & Mouse Lighting(basic)m Fixed Editor memory &initialization - 2026-10-27
+
+### Added
+- **Keyboard Matrix Grid & Paint Canvas:** Implemented per-key 6x22 matrix RGB lighting editor, visual painting canvas, color gamut color picker, and real-time hardware flushing.
+- **Mouse Zone Customization UI & Backend:** Added interactive mouse zone selection (Scroll Wheel, Logo, Keypad) and guarded `set_mouse_zone` handling in `RazerBackend` to safely interface with OpenRazer mouse features while preventing `NoneType` crashes.
+
+### Fixed
+- **Keyboard Matrix Persistence:** Fixed profile saving logic so clicking "Clear All" and saving cleanly flushes empty matrix data from JSON profiles instead of retaining prior color states.
+- **Editor Initialization:** Resolved initial launch state so the editor starts up clean without pre-selecting or prematurely highlighting keys.
 ---
 
 ## [1.0.6] - Debian Packaging Fixes & Path Resolution - 2026-10-25

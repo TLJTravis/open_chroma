@@ -83,6 +83,36 @@ class RazerBackend:
             logger.warning("set_static(%s) failed: %s", kind, e)
             return False
 
+    def set_mouse_zone(self, zone_idx: int, r: int, g: int, b: int) -> bool:
+        dev = self.devices.get("mouse")
+        if not dev:
+            return False
+        
+        if "mouse" in self.software_dim:
+            scale = self._level["mouse"] / 100.0
+            r, g, b = (round(c * scale) for c in (r, g, b))
+
+        try:
+            misc = getattr(dev.fx, 'misc', None)
+            zone_obj = None
+            
+            if misc:
+                if zone_idx == 0:
+                    zone_obj = getattr(misc, 'scroll_wheel', None)
+                elif zone_idx == 1:
+                    zone_obj = getattr(misc, 'logo', None)
+                elif zone_idx == 2:
+                    zone_obj = getattr(misc, 'backlight', None)
+
+            if zone_obj is not None:
+                zone_obj.static(r, g, b)
+            else:
+                dev.fx.static(r, g, b)
+            return True
+        except Exception as e:
+            logger.warning("set_mouse_zone(%s) failed: %s", zone_idx, e)
+            return False
+
     def set_breathing(self, kind: str, r: int, g: int, b: int) -> bool:
         """Native single-color breathing. Has no min/max range or speed control."""
         dev = self.devices.get(kind)
@@ -109,6 +139,39 @@ class RazerBackend:
             return True
         except Exception as e:
             logger.warning("set_brightness(%s) failed: %s", kind, e)
+            return False
+
+# ---- advanced matrix / zone painting -----------------------------------
+    def set_matrix_effect_custom(self, kind: str) -> bool:
+        dev = self.devices.get(kind)
+        return bool(dev and hasattr(dev, 'fx') and hasattr(dev.fx, 'advanced'))
+
+    def set_matrix_custom_frame(self, kind: str, matrix_data) -> bool:
+        dev = self.devices.get(kind)
+        if not dev or not hasattr(dev, 'fx') or not hasattr(dev.fx, 'advanced'):
+            return False
+        try:
+            advanced = dev.fx.advanced
+            matrix = advanced.matrix
+            
+            if kind == "keyboard" and isinstance(matrix_data, (list, tuple)):
+                for r_idx, row in enumerate(matrix_data):
+                    for c_idx, color in enumerate(row):
+                        try:
+                            matrix[r_idx, c_idx] = color
+                        except Exception:
+                            pass
+            elif kind == "mouse" and isinstance(matrix_data, (list, tuple)):
+                for idx, color in enumerate(matrix_data):
+                    try:
+                        matrix[idx] = color
+                    except Exception:
+                        pass
+            
+            advanced.draw()
+            return True
+        except Exception as e:
+            logger.error("set_matrix_custom_frame(%s) crashed: %s", kind, e)
             return False
 
     # ---- performance -------------------------------------------------------

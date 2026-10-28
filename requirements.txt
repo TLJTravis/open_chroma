@@ -1,3 +1,5 @@
 PyQt6>=6.0.0
 evdev>=1.6.0
 python-xlib>=0.33
+openrgb-python>=0.3.2
+dbus-python>=1.3.2

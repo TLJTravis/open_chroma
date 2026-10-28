@@ -34,7 +34,7 @@ This document outlines completed milestones, upcoming priorities, and long-term 
   - Update `install.sh` to download and verify checksums prior to execution.
   - *Acceptance Criteria:* Installation aborts immediately with an error if checksum verification fails.
 
-- [ ] **Input Device Access & Permission Verification**
+- [x] **Input Device Access & Permission Verification**
   - Verify exclusive access rights (`evdev` / OpenRazer daemon / `plugdev` group) prior to binding or remapping inputs.
   - *Acceptance Criteria:* Displays a user-friendly GUI/CLI notification if permissions are missing (e.g., user not in `plugdev` or missing `udev` rules).
 

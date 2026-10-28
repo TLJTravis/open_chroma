@@ -10,7 +10,6 @@
 import sys, json, os, glob, subprocess, logging, threading, time, urllib.request
 from pathlib import Path
 
-# Ensure Python looks in the script's own folder for local modules (e.g. razer_backend)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/usr/share/openchroma")
 
@@ -18,8 +17,9 @@ from threading import Thread
 from PyQt6.QtWidgets import (QApplication, QWidget, QGridLayout, QPushButton,
                              QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                              QComboBox, QButtonGroup, QMessageBox, QFileDialog, 
-                             QTabWidget, QFrame, QSlider, QInputDialog,
-                             QSystemTrayIcon, QMenu, QCheckBox, QStyle)
+                             QTabWidget, QFrame, QSlider, QInputDialog, QDialog,
+                             QSystemTrayIcon, QMenu, QCheckBox, QStyle, QStackedLayout,
+                             QGraphicsScene, QGraphicsView)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint, QRectF
 from PyQt6.QtGui import QColor, QPainter, QLinearGradient, QMouseEvent, QPen, QFont, QIcon, QAction, QPixmap
 
@@ -33,9 +33,6 @@ import evdev
 from evdev import UInput, ecodes as e
 from razer_backend import RazerBackend
 
-# ==============================================================================
-# GLOBAL CONFIGURATION & CONSTANTS
-# ==============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -45,18 +42,21 @@ logger = logging.getLogger("OpenChroma-Universal")
 PROFILE_FILE = os.path.expanduser("~/.config/naga_profiles.json")
 RAZER_VENDOR_ID = 0x1532
 
-# ==============================================================================
-# HARDWARE IMAGE CACHING HELPER
-# ==============================================================================
 def get_asset_path(filename):
-    paths = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", filename),
-        os.path.join("/usr/share/openchroma/assets", filename)
-    ]
-    for p in paths:
-        if os.path.exists(p):
-            return p
-    return paths[0]
+    base, ext = os.path.splitext(filename)
+    extensions = [ext, ".png", ".jpg", ".jpeg", ".webp"]
+    extensions = list(dict.fromkeys(extensions))
+    
+    for ext_candidate in extensions:
+        candidate_name = base + ext_candidate
+        paths = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", candidate_name),
+            os.path.join("/usr/share/openchroma/assets", candidate_name)
+        ]
+        for p in paths:
+            if os.path.exists(p):
+                return p
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", filename)
 
 def get_cached_device_image(device_name, image_url, fallback="OpenChroma"):
     cache_dir = os.path.expanduser("~/.cache/openchroma/images")
@@ -88,9 +88,6 @@ def get_cached_device_image(device_name, image_url, fallback="OpenChroma"):
             
     return local_path if os.path.exists(local_path) else None
 
-# ==============================================================================
-# 0. DPI OSD NOTIFICATION POPUP WIDGET
-# ==============================================================================
 class DpiOsdOverlay(QLabel):
     def __init__(self):
         super().__init__()
@@ -131,9 +128,6 @@ class DpiOsdOverlay(QLabel):
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowDoesNotAcceptFocus)
         self.timer.start(1200)
 
-# ==============================================================================
-# 1. EMBEDDED 16M GAMUT COLOR SPECTRUM WIDGET
-# ==============================================================================
 class GamutSpectrumWidget(QWidget):
     colorSelected = pyqtSignal(QColor)
 
@@ -186,9 +180,781 @@ class GamutSpectrumWidget(QWidget):
         self.colorSelected.emit(col)
         self.update()
 
-# ==============================================================================
-# 2. UNIVERSAL AUTO-PROFILE WORKER THREAD (GNOME DBUS + X11 FALLBACK)
-# ==============================================================================
+class MouseZoneWidget(QWidget):
+    def __init__(self, razer_backend, parent=None):
+        super().__init__(parent)
+        self.razer = razer_backend
+        self.target = "mouse"
+        self.current_color = QColor(0, 255, 0)
+        self.selected_zone = 0  # Track currently active zone
+        
+        self.color_buffer = [[0, 255, 0], [0, 255, 0], [0, 255, 0]]
+        self.zone_names = ["Scroll Wheel", "Mouse Logo", "Side Keypad"]
+        
+        self.zone_locations = {
+            0: (58, 20, 18, 30),
+            1: (50, 85, 34, 34),
+            2: (25, 52, 16, 28)
+        }
+        
+        # Initialize safe OpenRGB connection bypassing plugin StopIteration error
+        self.rgb_client = None
+        self.rgb_mouse = None
+        try:
+            from openrgb import OpenRGBClient
+            class SafeOpenRGBClient(OpenRGBClient):
+                def update(self):
+                    try:
+                        super().update()
+                    except StopIteration:
+                        pass
+
+            self.rgb_client = SafeOpenRGBClient('127.0.0.1', 6742)
+            self.rgb_client.get_devices()
+            devices = self.rgb_client.get_devices_by_name('Razer Naga Trinity')
+            if devices:
+                self.rgb_mouse = devices[0]
+        except Exception as e:
+            logger.debug(f"OpenRGB client initialization note: {e}")
+
+        self.init_ui()
+        self.select_zone(0)
+
+    def init_ui(self):
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(15)
+
+        left_card = QWidget()
+        left_card.setStyleSheet("background-color: #1a1a1a; border: 1px solid #333333; border-radius: 6px;")
+        left_main_layout = QVBoxLayout(left_card)
+        left_main_layout.setContentsMargins(12, 12, 12, 12)
+        left_main_layout.setSpacing(10)
+
+        left_main_layout.addWidget(QLabel("<b style='color: #ffffff; font-size: 11px;'>ZONE PAINT CANVAS (MOUSE VIEW)</b>"))
+
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(15)
+
+        mouse_img_path = get_asset_path("NagaKlingon.png")
+        scene = QGraphicsScene(self)
+        self.highlight_overlays = {}
+        
+        if os.path.exists(mouse_img_path):
+            base_pixmap = QPixmap(mouse_img_path).scaled(
+                130, 180, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
+            scene.addPixmap(base_pixmap)
+            
+            for zone_id, rect in self.zone_locations.items():
+                x, y, w, h = rect
+                hl = QWidget()
+                hl.setStyleSheet("background-color: transparent; border: 2px solid #00ff00; border-radius: 3px;")
+                hl.setGeometry(x, y, w, h)
+                scene.addWidget(hl)
+                hl.hide()
+                self.highlight_overlays[zone_id] = hl
+        
+        view = QGraphicsView(scene)
+        view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        view.setStyleSheet("background: transparent; border: none;")
+        view.setFixedSize(135, 185)
+        content_layout.addWidget(view)
+
+        zones_btn_layout = QVBoxLayout()
+        zones_btn_layout.setSpacing(8)
+        zones_btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.zone_buttons = {}
+        for idx, name in enumerate(self.zone_names):
+            btn = QPushButton(f"[ {name} ]")
+            btn.setFixedHeight(34)
+            btn.setFixedWidth(130)
+            btn.setStyleSheet("background-color: #121212; border: 1px solid #444444; border-radius: 4px; color: #ffffff; font-weight: bold; font-size: 11px;")
+            btn.clicked.connect(lambda checked, i=idx: self.select_zone(i))
+            zones_btn_layout.addWidget(btn)
+            self.zone_buttons[idx] = btn
+
+        content_layout.addLayout(zones_btn_layout)
+        left_main_layout.addLayout(content_layout)
+        main_layout.addWidget(left_card, stretch=1)
+
+        right_card = QWidget()
+        right_card.setStyleSheet("background-color: #1a1a1a; border: 1px solid #333333; border-radius: 6px;")
+        right_main_layout = QVBoxLayout(right_card)
+        right_main_layout.setContentsMargins(12, 12, 12, 12)
+        right_main_layout.setSpacing(10)
+
+        right_main_layout.addWidget(QLabel("<b style='color: #ffffff; font-size: 11px;'>ZONE BRUSH COLOR GAMUT</b>"))
+
+        self.local_spectrum = GamutSpectrumWidget()
+        self.local_spectrum.colorSelected.connect(self.on_local_color_picked)
+        right_main_layout.addWidget(self.local_spectrum)
+
+        hex_layout = QHBoxLayout()
+        hex_layout.setSpacing(8)
+
+        self.local_preview = QLabel()
+        self.local_preview.setFixedSize(60, 30)
+        self.local_preview.setStyleSheet(f"background-color: {self.current_color.name()}; border: 1px solid #555555; border-radius: 4px;")
+        hex_layout.addWidget(self.local_preview)
+
+        hex_layout.addWidget(QLabel("Hex:"))
+        self.local_hex = QLineEdit()
+        self.local_hex.setText(self.current_color.name())
+        self.local_hex.setFixedWidth(90)
+        self.local_hex.returnPressed.connect(self.apply_local_hex)
+        hex_layout.addWidget(self.local_hex)
+
+        apply_btn = QPushButton("Apply")
+        apply_btn.setFixedHeight(30)
+        apply_btn.setFixedWidth(70)
+        apply_btn.setStyleSheet("background-color: #222222; border: 1px solid #555555; border-radius: 4px; color: #ffffff; font-weight: bold;")
+        apply_btn.clicked.connect(self.apply_local_hex)
+        hex_layout.addWidget(apply_btn)
+        hex_layout.addStretch()
+
+        right_main_layout.addLayout(hex_layout)
+        right_main_layout.addStretch()
+
+        main_layout.addWidget(right_card, stretch=1)
+
+    def select_zone(self, index):
+        self.selected_zone = index
+        for hl in self.highlight_overlays.values():
+            hl.hide()
+        for idx, btn in self.zone_buttons.items():
+            rgb = self.color_buffer[idx]
+            color_str = f"rgb({rgb[0]}, {rgb[1]}, {rgb[2]})"
+            border = "2px solid #00ff00" if idx == index else "1px solid #444444"
+            btn.setStyleSheet(f"background-color: {color_str}; border: {border}; border-radius: 4px; color: #000000; font-weight: bold; font-size: 11px;")
+
+        if index in self.highlight_overlays:
+            self.highlight_overlays[index].show()
+
+    def on_local_color_picked(self, col: QColor):
+        self.current_color = col
+        hex_str = col.name()
+        self.local_hex.blockSignals(True)
+        self.local_hex.setText(hex_str)
+        self.local_hex.blockSignals(False)
+        self.local_preview.setStyleSheet(f"background-color: {hex_str}; border: 1px solid #555555; border-radius: 4px;")
+
+    def apply_local_hex(self):
+        text = self.local_hex.text().strip()
+        if not text.startswith("#"):
+            text = "#" + text
+        col = QColor(text)
+        if col.isValid():
+            self.current_color = col
+            hex_str = col.name()
+            self.local_preview.setStyleSheet(f"background-color: {hex_str}; border: 1px solid #555555; border-radius: 4px;")
+            
+            # Apply color to the currently selected zone
+            rgb = [col.red(), col.green(), col.blue()]
+            self.color_buffer[self.selected_zone] = rgb
+            self.select_zone(self.selected_zone)
+            self.flush_frame()
+        else:
+            QMessageBox.warning(self, "Invalid Hex", f"Could not parse '{text}' as a valid hex color code.")
+
+    def set_brush_color(self, color: QColor):
+        self.current_color = color
+        self.on_local_color_picked(color)
+
+    def load_frame(self, buffer):
+        if isinstance(buffer, list) and len(buffer) == 3:
+            self.color_buffer = buffer
+        self.select_zone(self.selected_zone)
+
+    def flush_frame(self):
+        try:
+            if not self.rgb_client:
+                from openrgb import OpenRGBClient
+                class SafeOpenRGBClient(OpenRGBClient):
+                    def update(self):
+                        try:
+                            super().update()
+                        except StopIteration:
+                            pass
+                self.rgb_client = SafeOpenRGBClient('127.0.0.1', 6742)
+
+            if self.rgb_client:
+                if not self.rgb_mouse:
+                    for d in self.rgb_client.devices:
+                        if 'Naga' in d.name:
+                            self.rgb_mouse = d
+                            break
+
+                if self.rgb_mouse:
+                    from openrgb.utils import RGBColor
+                    for idx, rgb in enumerate(self.color_buffer):
+                        if idx < len(self.rgb_mouse.zones):
+                            color_obj = RGBColor(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+                            for led in self.rgb_mouse.zones[idx].leds:
+                                led.set_color(color_obj)
+                    self.rgb_mouse.show()
+        except Exception as e:
+            logger.debug(f"OpenRGB zone flush handled: {e}")
+
+class PaintableKeyButton(QPushButton):
+    def __init__(self, key_name, editor_dialog, parent=None):
+        super().__init__(key_name, parent)
+        self.key_name = key_name
+        self.editor = editor_dialog
+        self.setCheckable(False)  # Disable native checkable behavior to stop hover toggles
+        self.setMouseTracking(False)
+
+    def mousePressEvent(self, event):
+        if self.editor and event.button() == Qt.MouseButton.LeftButton:
+            self.editor.is_dragging = True
+            # Toggle or add to selection
+            self.editor.toggle_key_selection(self.key_name)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # Only select/paint while dragging with left mouse button held down
+        if self.editor and getattr(self.editor, 'is_dragging', False):
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                if self.key_name not in self.editor.selected_keys:
+                    self.editor.selected_keys.add(self.key_name)
+                    self.editor.update_key_styles()
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        if self.editor and getattr(self.editor, 'is_dragging', False):
+            self.editor.start_drag_paint(self.key_name)
+
+class KeyboardEditorDialog(QDialog):
+    def __init__(self, razer_backend, current_buffer, parent=None):
+        super().__init__(parent)
+        self.razer = razer_backend
+        self.target = "keyboard"
+        self.current_color = QColor(0, 255, 0)
+        self.setWindowTitle("OpenChroma - Keyboard Lighting Editor")
+        self.resize(1120, 640)
+
+        # Unified Coordinate Mapping
+        self.coords = {
+            "Esc": (0, 0, 0), "F1": (0, 2, 2), "F2": (0, 3, 3), "F3": (0, 4, 4), "F4": (0, 5, 5),
+            "F5": (0, 6, 6), "F6": (0, 7, 7), "F7": (0, 8, 8), "F8": (0, 9, 9),
+            "F9": (0, 10, 10), "F10": (0, 11, 11), "F11": (0, 12, 12), "F12": (0, 13, 13),
+            "PrtSc": (0, 15, 15), "ScrollLock": (0, 16, 16), "Pause": (0, 17, 17),
+            "`": (1, 0, 0), "1": (1, 1, 1), "2": (1, 2, 2), "3": (1, 3, 3),
+            "4": (1, 4, 4), "5": (1, 5, 5), "6": (1, 6, 6), "7": (1, 7, 7),
+            "8": (1, 8, 8), "9": (1, 9, 9), "0": (1, 10, 10), "-": (1, 11, 11),
+            "=": (1, 12, 12), "Backspace": (1, 13, 14),
+            "Ins": (1, 15, 15), "Home": (1, 16, 16), "PgUp": (1, 17, 17),
+            "NumLock": (1, 18, 18), "Num_/": (1, 19, 19), "Num_*": (1, 20, 20), "Num_-": (1, 21, 21),
+            "Tab": (2, 0, 1), "Q": (2, 2, 2), "W": (2, 3, 3), "E": (2, 4, 4),
+            "R": (2, 5, 5), "T": (2, 6, 6), "Y": (2, 7, 7), "U": (2, 8, 8),
+            "I": (2, 9, 9), "O": (2, 10, 10), "P": (2, 11, 11), "[": (2, 12, 12),
+            "]": (2, 13, 13), "\\": (2, 14, 15),
+            "Del": (2, 15, 15), "End": (2, 16, 16), "PgDn": (2, 17, 17),
+            "Num_7": (2, 18, 18), "Num_8": (2, 19, 19), "Num_9": (2, 20, 20), "Num_+": (2, 21, 21, 3, 21),
+            "Caps": (3, 0, 1), "A": (3, 2, 2), "S": (3, 3, 3), "D": (3, 4, 4),
+            "F": (3, 5, 5), "G": (3, 6, 6), "H": (3, 7, 7), "J": (3, 8, 8),
+            "K": (3, 9, 9), "L": (3, 10, 10), ";": (3, 11, 11), "'": (3, 12, 12),
+            "Enter": (3, 13, 14), "Num_4": (3, 18, 18), "Num_5": (3, 19, 19), "Num_6": (3, 20, 20),
+            "Shift": (4, 0, 2), "Z": (4, 3, 3), "X": (4, 4, 4), "C": (4, 5, 5),
+            "V": (4, 6, 6), "B": (4, 7, 7), "N": (4, 8, 8), "M": (4, 9, 9),
+            ",": (4, 10, 10), ".": (4, 11, 11), "/": (4, 12, 12), "RShift": (4, 13, 15),
+            "↑": (4, 16, 16), "Num_1": (4, 18, 18), "Num_2": (4, 19, 19), "Num_3": (4, 20, 20), "Num_Enter": (4, 21, 21, 5, 21),
+            "Ctrl": (5, 0, 0), "Win": (5, 1, 1), "Alt": (5, 2, 2),
+            "Space": (5, 5, 9), "RAlt": (5, 11, 11), "Fn": (5, 12, 12),
+            "Menu": (5, 13, 13), "RCtrl": (5, 14, 14),
+            "←": (5, 15, 15), "↓": (5, 16, 16), "→": (5, 17, 17),
+            "Num_0": (5, 18, 19), "Num_.": (5, 20, 20)
+        }
+
+        main_app = parent.window() if parent else self.window()
+        self.active_profile_name = "Default Profile"
+        if main_app and hasattr(main_app, 'get_active_profile_name'):
+            self.active_profile_name = main_app.get_active_profile_name()
+
+        # Load buffer; if empty, start completely clean with no keys pre-selected or forced
+        self.color_buffer = {}
+        if isinstance(current_buffer, dict) and current_buffer:
+            self.color_buffer = dict(current_buffer)
+        elif main_app and hasattr(main_app, 'profiles') and self.active_profile_name in main_app.profiles:
+            prof_data = main_app.profiles[self.active_profile_name]
+            if isinstance(prof_data, dict) and "matrix" in prof_data and "keyboard" in prof_data["matrix"]:
+                self.color_buffer = dict(prof_data["matrix"]["keyboard"])
+        
+        if not self.color_buffer:
+            for k in self.coords.keys():
+                self.color_buffer[k] = [0, 255, 0]
+
+        self.selected_keys = set()
+        self.key_buttons = {}
+        self.is_dragging = False
+        
+        self.init_ui()
+        self.update_key_styles()
+        self.flush_frame()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(12)
+
+        top_control_layout = QHBoxLayout()
+        top_control_layout.setSpacing(15)
+
+        action_card = QWidget()
+        action_card.setStyleSheet("background-color: #1e1e1e; border: 1px solid #333333; border-radius: 6px;")
+        action_layout = QVBoxLayout(action_card)
+        action_layout.setContentsMargins(12, 10, 12, 10)
+        action_layout.setSpacing(8)
+
+        action_layout.addWidget(QLabel("<b style='color: #00ff00; font-size: 11px;'>KEY SELECTION & PAINTING CONTROLS</b>"))
+        
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self.color_indicator = QLabel()
+        self.color_indicator.setFixedSize(36, 28)
+        self.color_indicator.setStyleSheet(f"background-color: {self.current_color.name()}; border: none; border-radius: 3px;")
+        btn_row.addWidget(self.color_indicator)
+
+        set_btn = QPushButton("Set Selected")
+        set_btn.setFixedHeight(28)
+        set_btn.clicked.connect(self.apply_color_to_selected)
+        btn_row.addWidget(set_btn)
+
+        deselect_btn = QPushButton("Deselect")
+        deselect_btn.setFixedHeight(28)
+        deselect_btn.clicked.connect(self.deselect_all_keys)
+        btn_row.addWidget(deselect_btn)
+
+        clear_btn = QPushButton("Clear Key")
+        clear_btn.setFixedHeight(28)
+        clear_btn.clicked.connect(self.clear_selected_keys)
+        btn_row.addWidget(clear_btn)
+
+        clear_all_btn = QPushButton("Clear All")
+        clear_all_btn.setFixedHeight(28)
+        clear_all_btn.clicked.connect(self.clear_all_keys)
+        btn_row.addWidget(clear_all_btn)
+
+        action_layout.addLayout(btn_row)
+
+        close_row = QHBoxLayout()
+        close_row.addWidget(QLabel("Profile:"))
+        
+        self.profile_lbl = QLabel()
+        self.profile_lbl.setText(f"<b>{self.active_profile_name}</b>")
+        self.profile_lbl.setStyleSheet("color: #00ff00; background-color: #222222; border: 1px solid #333333; padding: 4px 10px; border-radius: 3px;")
+        self.profile_lbl.setFixedWidth(160)
+        self.profile_lbl.setFixedHeight(28)
+        close_row.addWidget(self.profile_lbl)
+
+        close_row.addStretch()
+        
+        save_close_btn = QPushButton("Save & Close Editor")
+        save_close_btn.setFixedHeight(30)
+        save_close_btn.setFixedWidth(150)
+        save_close_btn.setStyleSheet("background-color: #00ff00; color: #000000; border: none; font-weight: bold;")
+        save_close_btn.clicked.connect(self.save_and_close)
+        close_row.addWidget(save_close_btn)
+        
+        action_layout.addLayout(close_row)
+        top_control_layout.addWidget(action_card, stretch=2)
+
+        gamut_card = QWidget()
+        gamut_card.setStyleSheet("background-color: #1e1e1e; border: 1px solid #333333; border-radius: 6px;")
+        gamut_layout = QVBoxLayout(gamut_card)
+        gamut_layout.setContentsMargins(12, 10, 12, 10)
+        gamut_layout.setSpacing(6)
+
+        gamut_layout.addWidget(QLabel("<b style='color: #ffffff; font-size: 11px;'>GAMUT COLOR SPECTRUM</b>"))
+        
+        self.spectrum = GamutSpectrumWidget()
+        self.spectrum.setFixedHeight(65)
+        self.spectrum.colorSelected.connect(self.on_color_picked)
+        gamut_layout.addWidget(self.spectrum)
+
+        top_control_layout.addWidget(gamut_card, stretch=1)
+        main_layout.addLayout(top_control_layout)
+
+        grid_widget = QWidget()
+        grid_widget.setStyleSheet("background-color: #1a1a1a; border: 1px solid #333333; border-radius: 6px;")
+        self.grid_layout = QGridLayout(grid_widget)
+        self.grid_layout.setContentsMargins(12, 12, 12, 12)
+        self.grid_layout.setHorizontalSpacing(4)
+        self.grid_layout.setVerticalSpacing(4)
+
+        layout_map = [
+            ("Esc", "Esc", 0, 0, 1, 2),
+            ("F1", "F1", 0, 3, 1, 2), ("F2", "F2", 0, 5, 1, 2), ("F3", "F3", 0, 7, 1, 2), ("F4", "F4", 0, 9, 1, 2),
+            ("F5", "F5", 0, 11, 1, 2), ("F6", "F6", 0, 13, 1, 2), ("F7", "F7", 0, 15, 1, 2), ("F8", "F8", 0, 17, 1, 2),
+            ("F9", "F9", 0, 20, 1, 2), ("F10", "F10", 0, 22, 1, 2), ("F11", "F11", 0, 24, 1, 2), ("F12", "F12", 0, 26, 1, 2),
+            ("PrtSc", "Prt\nSc", 0, 29, 1, 2), ("ScrollLock", "Scroll\nLock", 0, 31, 1, 2), ("Pause", "Pause\nBreak", 0, 33, 1, 2),
+
+            ("`", "`", 1, 0, 1, 2), ("1", "1", 1, 2, 1, 2), ("2", "2", 1, 4, 1, 2), ("3", "3", 1, 6, 1, 2),
+            ("4", "4", 1, 8, 1, 2), ("5", "5", 1, 10, 1, 2), ("6", "6", 1, 12, 1, 2), ("7", "7", 1, 14, 1, 2),
+            ("8", "8", 1, 16, 1, 2), ("9", "9", 1, 18, 1, 2), ("0", "0", 1, 20, 1, 2), ("-", "-", 1, 22, 1, 2), 
+            ("=", "=", 1, 24, 1, 2), ("Backspace", "Backspace", 1, 26, 1, 3), 
+            ("Ins", "Ins", 1, 29, 1, 2), ("Home", "Home", 1, 31, 1, 2), ("PgUp", "Pg\nUp", 1, 33, 1, 2),
+            ("NumLock", "Num\nLock", 1, 36, 1, 2), ("Num_/", "/", 1, 38, 1, 2), ("Num_*", "*", 1, 40, 1, 2), ("Num_-", "-", 1, 42, 1, 2),
+
+            ("Tab", "Tab", 2, 0, 1, 3), ("Q", "Q", 2, 3, 1, 2), ("W", "W", 2, 5, 1, 2), ("E", "E", 2, 7, 1, 2),
+            ("R", "R", 2, 9, 1, 2), ("T", "T", 2, 11, 1, 2), ("Y", "Y", 2, 13, 1, 2), ("U", "U", 2, 15, 1, 2),
+            ("I", "I", 2, 17, 1, 2), ("O", "O", 2, 19, 1, 2), ("P", "P", 2, 21, 1, 2), ("[", "[", 2, 23, 1, 2), 
+            ("]", "]", 2, 25, 1, 2), ("\\", "\\", 2, 27, 1, 2), 
+            ("Del", "Del", 2, 29, 1, 2), ("End", "End", 2, 31, 1, 2), ("PgDn", "Pg\nDn", 2, 33, 1, 2),
+            ("Num_7", "7", 2, 36, 1, 2), ("Num_8", "8", 2, 38, 1, 2), ("Num_9", "9", 2, 40, 1, 2), ("Num_+", "+", 2, 42, 2, 2),
+
+            ("Caps", "Caps", 3, 0, 1, 4), ("A", "A", 3, 4, 1, 2), ("S", "S", 3, 6, 1, 2), ("D", "D", 3, 8, 1, 2),
+            ("F", "F", 3, 10, 1, 2), ("G", "G", 3, 12, 1, 2), ("H", "H", 3, 14, 1, 2), ("J", "J", 3, 16, 1, 2),
+            ("K", "K", 3, 18, 1, 2), ("L", "L", 3, 20, 1, 2), (";", ";", 3, 22, 1, 2), ("'", "'", 3, 24, 1, 2), 
+            ("Enter", "Enter", 3, 26, 1, 3),
+            ("Num_4", "4", 3, 36, 1, 2), ("Num_5", "5", 3, 38, 1, 2), ("Num_6", "6", 3, 40, 1, 2),
+
+            ("Shift", "Shift", 4, 0, 1, 5), ("Z", "Z", 4, 5, 1, 2), ("X", "X", 4, 7, 1, 2), ("C", "C", 4, 9, 1, 2),
+            ("V", "V", 4, 11, 1, 2), ("B", "B", 4, 13, 1, 2), ("N", "N", 4, 15, 1, 2), ("M", "M", 4, 17, 1, 2), 
+            (",", ",", 4, 19, 1, 2), (".", ".", 4, 21, 1, 2), ("/", "/", 4, 23, 1, 2), ("RShift", "RShift", 4, 25, 1, 4),
+            ("↑", "↑", 4, 31, 1, 2), 
+            ("Num_1", "1", 4, 36, 1, 2), ("Num_2", "2", 4, 38, 1, 2), ("Num_3", "3", 4, 40, 1, 2), ("Num_Enter", "Enter", 4, 42, 2, 2),
+
+            ("Ctrl", "Ctrl", 5, 0, 1, 3), ("Win", "Win", 5, 3, 1, 2), ("Alt", "Alt", 5, 5, 1, 2),
+            ("Space", "Space", 5, 7, 1, 12), ("RAlt", "RAlt", 5, 19, 1, 2), ("Fn", "Fn", 5, 21, 1, 2),
+            ("Menu", "Menu", 5, 23, 1, 2), ("RCtrl", "RCtrl", 5, 25, 1, 3),
+            ("←", "←", 5, 29, 1, 2), ("↓", "↓", 5, 31, 1, 2), ("→", "→", 5, 33, 1, 2),
+            ("Num_0", "0", 5, 36, 1, 4), ("Num_.", ".", 5, 40, 1, 2)
+        ]
+
+        for item in layout_map:
+            key_id, display_label, r, c, rowspan, colspan = item
+            btn = PaintableKeyButton(display_label, self)
+            btn.key_name = key_id
+            btn.setMinimumSize(28, 38)
+            self.grid_layout.addWidget(btn, r, c, rowspan, colspan)
+            self.key_buttons[key_id] = btn
+
+        main_layout.addWidget(grid_widget)
+
+        zones_bar = QHBoxLayout()
+        zones_bar.setContentsMargins(10, 5, 10, 5)
+        zones_bar.setSpacing(10)
+        zones_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        zones_bar.addWidget(QLabel("<b style='color: #00ff00; font-size: 12px;'>Quick Zone Paint:</b>"))
+
+        zones_info = [
+            ("F-Keys", "f_keys"),
+            ("QWERTY", "qwerty"),
+            ("Control / Nav", "control"),
+            ("Numpad", "numpad")
+        ]
+
+        for label_text, zone_key in zones_info:
+            z_btn = QPushButton(label_text)
+            z_btn.setFixedHeight(32)
+            z_btn.setFixedWidth(130)
+            z_btn.clicked.connect(lambda checked, z=zone_key: self.paint_zone_group(z))
+            zones_bar.addWidget(z_btn)
+
+        main_layout.addLayout(zones_bar)
+
+    def toggle_key_selection(self, key_name):
+        if key_name in self.selected_keys:
+            self.selected_keys.remove(key_name)
+        else:
+            self.selected_keys.add(key_name)
+        self.update_key_styles()
+
+    def start_drag_paint(self, key_name):
+        self.is_dragging = True
+        self.paint_key(key_name)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.is_dragging = False
+        super().mouseReleaseEvent(event)
+
+    def paint_key(self, key_name):
+        rgb = [self.current_color.red(), self.current_color.green(), self.current_color.blue()]
+        self.color_buffer[key_name] = rgb
+        self.update_key_styles()
+        self.flush_frame()
+
+    def update_key_styles(self):
+        for name, btn in self.key_buttons.items():
+            is_selected = name in self.selected_keys
+            col = self.color_buffer.get(name)
+            
+            if col:
+                bg_str = f"rgb({col[0]}, {col[1]}, {col[2]})"
+                luminance = (col[0] * 0.299 + col[1] * 0.587 + col[2] * 0.114)
+                txt_col = "#000000" if luminance > 120 else "#ffffff"
+            else:
+                bg_str = "#2b2b2b"
+                txt_col = "#dcdcdc"
+
+            border = "2px solid #ffffff" if is_selected else "1px solid #3c3c3c"
+            btn.setStyleSheet(
+                f"background-color: {bg_str}; "
+                f"border: {border}; "
+                f"border-radius: 4px; "
+                f"color: {txt_col}; "
+                f"font-size: 10px; "
+                f"font-weight: bold; "
+                f"padding: 1px;"
+            )
+
+    def apply_color_to_selected(self):
+        rgb = [self.current_color.red(), self.current_color.green(), self.current_color.blue()]
+        for k in self.selected_keys:
+            self.color_buffer[k] = rgb
+        self.update_key_styles()
+        self.flush_frame()
+
+    def deselect_all_keys(self):
+        self.selected_keys.clear()
+        self.update_key_styles()
+
+    def clear_selected_keys(self):
+        for k in self.selected_keys:
+            if k in self.color_buffer:
+                del self.color_buffer[k]
+        self.update_key_styles()
+        self.flush_frame()
+
+    def clear_all_keys(self):
+        self.color_buffer.clear()
+        self.selected_keys.clear()
+        self.update_key_styles()
+        self.flush_frame()
+
+    def on_color_picked(self, col: QColor):
+        self.current_color = col
+        hex_str = col.name()
+        self.color_indicator.setStyleSheet(f"background-color: {hex_str}; border: none; border-radius: 3px;")
+
+    def paint_zone_group(self, zone_type):
+        f_keys = {"Esc", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"}
+        qwerty_keys = {"`", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "=", "Backspace", 
+                       "Tab", "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "[", "]", "\\", 
+                       "Caps", "A", "S", "D", "F", "G", "H", "J", "K", "L", ";", "'", "Enter", 
+                       "Shift", "Z", "X", "C", "V", "B", "N", "M", ",", ".", "/", "RShift",
+                       "Ctrl", "Win", "Alt", "Space", "RAlt", "Fn", "Menu", "RCtrl"}
+        control_keys = {"PrtSc", "ScrollLock", "Pause", "Ins", "Home", "PgUp", "Del", "End", "PgDn", "↑", "←", "↓", "→"}
+        numpad_keys = {"NumLock", "Num_/", "Num_*", "Num_-", "Num_+", 
+                       "Num_7", "Num_8", "Num_9", "Num_4", "Num_5", "Num_6", 
+                       "Num_1", "Num_2", "Num_3", "Num_Enter", "Num_0", "Num_."}
+
+        target_set = {
+            "f_keys": f_keys,
+            "qwerty": qwerty_keys,
+            "control": control_keys,
+            "numpad": numpad_keys
+        }.get(zone_type, set())
+
+        rgb = [self.current_color.red(), self.current_color.green(), self.current_color.blue()]
+        for name in self.key_buttons.keys():
+            if name in target_set:
+                self.color_buffer[name] = rgb
+                self.selected_keys.add(name)
+
+        self.update_key_styles()
+        self.flush_frame()
+
+    def flush_frame(self):
+        try:
+            try:
+                self.razer.set_matrix_effect_custom(self.target)
+            except Exception as e:
+                logger.error(f"Failed to set custom matrix effect: {e}")
+
+            matrix = [[(0, 0, 0) for _ in range(22)] for _ in range(6)]
+            
+            for key_name, rgb in self.color_buffer.items():
+                if key_name in self.coords:
+                    info = self.coords[key_name]
+                    r_idx = info[0]
+                    c_start = info[1]
+                    c_end = info[2]
+                    r_end = info[3] if len(info) > 3 else r_idx
+                    color_tuple = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+                    for r in range(r_idx, r_end + 1):
+                        for c in range(c_start, c_end + 1):
+                            if 0 <= r < 6 and 0 <= c < 22:
+                                matrix[r][c] = color_tuple
+
+            matrix_tuples = [tuple(row) for row in matrix]
+            self.razer.set_matrix_custom_frame(self.target, matrix_tuples)
+        except Exception as e:
+            logger.error(f"Keyboard custom frame flush error: {e}")
+
+    def save_and_close(self):
+        main_app = self.parent() or self.window()
+        
+        target_profile = "Default Profile"
+        if main_app and hasattr(main_app, 'get_active_profile_name'):
+            target_profile = main_app.get_active_profile_name()
+            
+        if main_app and hasattr(main_app, 'profiles') and target_profile in main_app.profiles:
+            if "matrix" not in main_app.profiles[target_profile]:
+                main_app.profiles[target_profile]["matrix"] = {}
+            
+            # Condense buffer, keeping only non-default colors
+            condensed_buffer = {k: rgb for k, rgb in self.color_buffer.items() if rgb != [0, 255, 0]}
+            
+            # Explicitly assign the buffer (will be {} if cleared, wiping the JSON entry)
+            main_app.profiles[target_profile]["matrix"]["keyboard"] = condensed_buffer
+            
+            if hasattr(main_app, 'save_profiles'):
+                main_app.save_profiles()
+            elif hasattr(main_app, 'save_config'):
+                main_app.save_config()
+            else:
+                main_app.save_to_disk()
+
+        QMessageBox.information(self, "Success", f"Keyboard layout saved successfully to '{target_profile}'!")
+        self.accept()
+
+class RazerGenieKeyboardWidget(QWidget):
+    def __init__(self, razer_backend, parent=None):
+        super().__init__(parent)
+        self.razer = razer_backend
+        self.color_buffer = {}
+        
+        # Robustly find main application instance
+        main_app = parent
+        if not main_app:
+            for w in QApplication.topLevelWidgets():
+                if hasattr(w, 'get_active_profile_name') and hasattr(w, 'profiles'):
+                    main_app = w
+                    break
+        if not main_app and parent:
+            main_app = parent.window()
+
+        if main_app and hasattr(main_app, 'get_active_profile_name'):
+            curr_prof = main_app.get_active_profile_name()
+            if hasattr(main_app, 'profiles') and curr_prof in main_app.profiles:
+                prof_data = main_app.profiles[curr_prof]
+                if isinstance(prof_data, dict) and "matrix" in prof_data and "keyboard" in prof_data["matrix"]:
+                    self.color_buffer = dict(prof_data["matrix"]["keyboard"])
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(15)
+
+        info_lbl = QLabel("<b>Advanced Keyboard Custom Editor</b><br>Click below to launch the full-size ANSI US QWERTY editor window.")
+        info_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(info_lbl)
+
+        launch_btn = QPushButton("Open Full Keyboard Editor")
+        launch_btn.setFixedHeight(45)
+        launch_btn.setFixedWidth(260)
+        launch_btn.setStyleSheet("background-color: #00ff00; color: #000000; font-weight: bold; border-radius: 4px;")
+        launch_btn.clicked.connect(self.open_editor_dialog)
+        layout.addWidget(launch_btn)
+
+        QTimer.singleShot(50, self.flush_frame)
+
+    def open_editor_dialog(self):
+        main_app = self.window()
+        curr_prof = main_app.get_active_profile_name() if main_app else "Default Profile"
+        
+        buffer_to_pass = {}
+        if self.color_buffer:
+            buffer_to_pass = dict(self.color_buffer)
+        elif main_app and curr_prof in main_app.profiles:
+            prof_data = main_app.profiles[curr_prof]
+            if isinstance(prof_data, dict) and "matrix" in prof_data and "keyboard" in prof_data["matrix"]:
+                buffer_to_pass = dict(prof_data["matrix"]["keyboard"])
+        
+        dialog = KeyboardEditorDialog(self.razer, buffer_to_pass, main_app)
+        if dialog.exec() == 1:
+            self.color_buffer = dict(dialog.color_buffer)
+            self.flush_frame()
+
+    def set_brush_color(self, color: QColor):
+        pass
+
+    def load_frame(self, buffer):
+        if isinstance(buffer, dict) and buffer:
+            self.color_buffer = dict(buffer)
+        else:
+            # Fallback to active profile JSON if buffer is empty
+            main_app = self.window()
+            if main_app and hasattr(main_app, 'get_active_profile_name'):
+                curr_prof = main_app.get_active_profile_name()
+                if curr_prof in main_app.profiles:
+                    prof_data = main_app.profiles[curr_prof]
+                    if isinstance(prof_data, dict) and "matrix" in prof_data and "keyboard" in prof_data["matrix"]:
+                        self.color_buffer = dict(prof_data["matrix"]["keyboard"])
+        self.flush_frame()
+
+    def flush_frame(self):
+        try:
+            try:
+                self.razer.set_matrix_effect_custom("keyboard")
+            except Exception as e:
+                logger.error(f"Failed to set keyboard custom matrix effect: {e}")
+            
+            matrix = [[(0, 0, 0) for _ in range(22)] for _ in range(6)]
+            coords = {
+                "Esc": (0, 0, 0), "F1": (0, 2, 2), "F2": (0, 3, 3), "F3": (0, 4, 4), "F4": (0, 5, 5),
+                "F5": (0, 6, 6), "F6": (0, 7, 7), "F7": (0, 8, 8), "F8": (0, 9, 9),
+                "F9": (0, 10, 10), "F10": (0, 11, 11), "F11": (0, 12, 12), "F12": (0, 13, 13),
+                "PrtSc": (0, 15, 15), "ScrollLock": (0, 16, 16), "Pause": (0, 17, 17),
+                "`": (1, 0, 0), "1": (1, 1, 1), "2": (1, 2, 2), "3": (1, 3, 3),
+                "4": (1, 4, 4), "5": (1, 5, 5), "6": (1, 6, 6), "7": (1, 7, 7),
+                "8": (1, 8, 8), "9": (1, 9, 9), "0": (1, 10, 10), "-": (1, 11, 11),
+                "=": (1, 12, 12), "Backspace": (1, 13, 14),
+                "Ins": (1, 15, 15), "Home": (1, 16, 16), "PgUp": (1, 17, 17),
+                "NumLock": (1, 18, 18), "Num_/": (1, 19, 19), "Num_*": (1, 20, 20), "Num_-": (1, 21, 21),
+                "Tab": (2, 0, 1), "Q": (2, 2, 2), "W": (2, 3, 3), "E": (2, 4, 4),
+                "R": (2, 5, 5), "T": (2, 6, 6), "Y": (2, 7, 7), "U": (2, 8, 8),
+                "I": (2, 9, 9), "O": (2, 10, 10), "P": (2, 11, 11), "[": (2, 12, 12),
+                "]": (2, 13, 13), "\\": (2, 14, 15),
+                "Del": (2, 15, 15), "End": (2, 16, 16), "PgDn": (2, 17, 17),
+                "Num_7": (2, 18, 18), "Num_8": (2, 19, 19), "Num_9": (2, 20, 20), "Num_+": (2, 21, 21, 3, 21),
+                "Caps": (3, 0, 1), "A": (3, 2, 2), "S": (3, 3, 3), "D": (3, 4, 4),
+                "F": (3, 5, 5), "G": (3, 6, 6), "H": (3, 7, 7), "J": (3, 8, 8),
+                "K": (3, 9, 9), "L": (3, 10, 10), ";": (3, 11, 11), "'": (3, 12, 12),
+                "Enter": (3, 13, 14), "Num_4": (3, 18, 18), "Num_5": (3, 19, 19), "Num_6": (3, 20, 20),
+                "Shift": (4, 0, 2), "Z": (4, 3, 3), "X": (4, 4, 4), "C": (4, 5, 5),
+                "V": (4, 6, 6), "B": (4, 7, 7), "N": (4, 8, 8), "M": (4, 9, 9),
+                ",": (4, 10, 10), ".": (4, 11, 11), "/": (4, 12, 12), "RShift": (4, 13, 15),
+                "↑": (4, 16, 16), "Num_1": (4, 18, 18), "Num_2": (4, 19, 19), "Num_3": (4, 20, 20), "Num_Enter": (4, 21, 21, 5, 21),
+                "Ctrl": (5, 0, 0), "Win": (5, 1, 1), "Alt": (5, 2, 2),
+                "Space": (5, 5, 9), "RAlt": (5, 11, 11), "Fn": (5, 12, 12),
+                "Menu": (5, 13, 13), "RCtrl": (5, 14, 14),
+                "←": (5, 15, 15), "↓": (5, 16, 16), "→": (5, 17, 17),
+                "Num_0": (5, 18, 19), "Num_.": (5, 20, 20)
+            }
+
+            for key_name, rgb in self.color_buffer.items():
+                if key_name in coords:
+                    info = coords[key_name]
+                    r_idx = info[0]
+                    c_start = info[1]
+                    c_end = info[2]
+                    r_end = info[3] if len(info) > 3 else r_idx
+                    color_tuple = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+                    for r in range(r_idx, r_end + 1):
+                        for c in range(c_start, c_end + 1):
+                            if 0 <= r < 6 and 0 <= c < 22:
+                                matrix[r][c] = color_tuple
+
+            matrix_tuples = [tuple(row) for row in matrix]
+            self.razer.set_matrix_custom_frame("keyboard", matrix_tuples)
+        except Exception as e:
+            logger.error(f"Keyboard matrix flush error: {e}")
+
+    def update_target(self, target):
+        pass
+
 class SignalBridge(QWidget):
     window_changed_signal = pyqtSignal(tuple)
 
@@ -205,7 +971,6 @@ class AutoProfileWorker(Thread):
         wm_class = ""
         title = ""
         
-        # 1. X11 Backend (Linux Mint / Xorg / Cinnamon) using xdotool
         if self.session_type != "wayland" or os.environ.get("DISPLAY"):
             try:
                 class_res = subprocess.run(
@@ -227,7 +992,6 @@ class AutoProfileWorker(Thread):
             except Exception:
                 pass
 
-        # 2. Wayland / GNOME Shell DBus Backend
         if HAS_DBUS:
             try:
                 session_bus = dbus.SessionBus()
@@ -258,9 +1022,6 @@ class AutoProfileWorker(Thread):
             if self.shutdown_event.wait(1.5):
                 break
 
-# ==============================================================================
-# 3. LIVE INPUT DAEMON (MULTI-DEVICE SCANNER & UINPUT)
-# ==============================================================================
 class LiveInputDaemon(Thread):
     def __init__(self, get_current_profile_bindings_callback, app_reference, shutdown_event):
         super().__init__()
@@ -269,23 +1030,29 @@ class LiveInputDaemon(Thread):
         self.app = app_reference
         self.shutdown_event = shutdown_event
         self.uinput = None
+        # Track currently held virtual codes to prevent stuck modifiers
+        self.active_virtual_codes = set()
 
     def init_uinput(self):
         try:
             capabilities = {
-                e.EV_KEY: [
-                    e.KEY_A, e.KEY_B, e.KEY_C, e.KEY_D, e.KEY_E, e.KEY_F, e.KEY_G,
-                    e.KEY_H, e.KEY_I, e.KEY_J, e.KEY_K, e.KEY_L, e.KEY_M, e.KEY_N,
-                    e.KEY_O, e.KEY_P, e.KEY_Q, e.KEY_R, e.KEY_S, e.KEY_T, e.KEY_U,
-                    e.KEY_V, e.KEY_W, e.KEY_X, e.KEY_Y, e.KEY_Z,
-                    e.KEY_1, e.KEY_2, e.KEY_3, e.KEY_4, e.KEY_5, e.KEY_6, e.KEY_7,
-                    e.KEY_8, e.KEY_9, e.KEY_0, e.KEY_MINUS, e.KEY_EQUAL,
-                    e.KEY_LEFTCTRL, e.KEY_LEFTSHIFT, e.KEY_LEFTALT,
-                    e.KEY_F1, e.KEY_F2, e.KEY_F3, e.KEY_F4, e.KEY_F5, e.KEY_F6,
-                    e.KEY_F7, e.KEY_F8, e.KEY_F9, e.KEY_F10, e.KEY_F11, e.KEY_F12,
-                    e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE, e.BTN_SIDE, e.BTN_EXTRA
-                ],
-                e.EV_REL: [e.REL_WHEEL, e.REL_HWHEEL]
+            e.EV_KEY: [
+                e.KEY_A, e.KEY_B, e.KEY_C, e.KEY_D, e.KEY_E, e.KEY_F, e.KEY_G,
+                e.KEY_H, e.KEY_I, e.KEY_J, e.KEY_K, e.KEY_L, e.KEY_M, e.KEY_N,
+                e.KEY_O, e.KEY_P, e.KEY_Q, e.KEY_R, e.KEY_S, e.KEY_T, e.KEY_U,
+                e.KEY_V, e.KEY_W, e.KEY_X, e.KEY_Y, e.KEY_Z,
+                e.KEY_1, e.KEY_2, e.KEY_3, e.KEY_4, e.KEY_5, e.KEY_6, e.KEY_7,
+                e.KEY_8, e.KEY_9, e.KEY_0, e.KEY_MINUS, e.KEY_EQUAL,
+                e.KEY_LEFTCTRL, e.KEY_LEFTSHIFT, e.KEY_LEFTALT,
+                e.KEY_F1, e.KEY_F2, e.KEY_F3, e.KEY_F4, e.KEY_F5, e.KEY_F6,
+                e.KEY_F7, e.KEY_F8, e.KEY_F9, e.KEY_F10, e.KEY_F11, e.KEY_F12,
+                e.KEY_KPSLASH, e.KEY_KPASTERISK, e.KEY_KPMINUS, e.KEY_KPPLUS,
+                e.KEY_KPENTER, e.KEY_KP0, e.KEY_KP1, e.KEY_KP2, e.KEY_KP3,
+                e.KEY_KP4, e.KEY_KP5, e.KEY_KP6, e.KEY_KP7, e.KEY_KP8,
+                e.KEY_KP9, e.KEY_KPDOT,
+                e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE, e.BTN_SIDE, e.BTN_EXTRA
+            ],
+            e.EV_REL: [e.REL_WHEEL, e.REL_HWHEEL]
             }
             self.uinput = UInput(capabilities, name="OpenChroma-Virtual-Input")
             logger.info("Initialized evdev UInput virtual device.")
@@ -314,11 +1081,9 @@ class LiveInputDaemon(Thread):
                 "Left Click": e.BTN_LEFT, "Right Click": e.BTN_RIGHT,
                 "Middle Click": e.BTN_MIDDLE
             }
-            if action_str in click_map and is_press:
-                self.uinput.write(e.EV_KEY, click_map[action_str], 1)
-                self.uinput.syn()
-            elif action_str in click_map and not is_press:
-                self.uinput.write(e.EV_KEY, click_map[action_str], 0)
+            if action_str in click_map:
+                val = 1 if is_press else 0
+                self.uinput.write(e.EV_KEY, click_map[action_str], val)
                 self.uinput.syn()
             return
 
@@ -328,6 +1093,12 @@ class LiveInputDaemon(Thread):
             "1": e.KEY_1, "2": e.KEY_2, "3": e.KEY_3, "4": e.KEY_4, "5": e.KEY_5,
             "6": e.KEY_6, "7": e.KEY_7, "8": e.KEY_8, "9": e.KEY_9, "0": e.KEY_0,
             "-": e.KEY_MINUS, "=": e.KEY_EQUAL,
+            "kp_divide": e.KEY_KPSLASH, "kp_multiply": e.KEY_KPASTERISK,
+            "kp_minus": e.KEY_KPMINUS, "kp_plus": e.KEY_KPPLUS,
+            "kp_enter": e.KEY_KPENTER, "kp_0": e.KEY_KP0, "kp_1": e.KEY_KP1,
+            "kp_2": e.KEY_KP2, "kp_3": e.KEY_KP3, "kp_4": e.KEY_KP4,
+            "kp_5": e.KEY_KP5, "kp_6": e.KEY_KP6, "kp_7": e.KEY_KP7,
+            "kp_8": e.KEY_KP8, "kp_9": e.KEY_KP9, "kp_decimal": e.KEY_KPDOT,
             "a": e.KEY_A, "b": e.KEY_B, "c": e.KEY_C, "d": e.KEY_D, "e": e.KEY_E,
             "f": e.KEY_F, "g": e.KEY_G, "h": e.KEY_H, "i": e.KEY_I, "j": e.KEY_J,
             "k": e.KEY_K, "l": e.KEY_L, "m": e.KEY_M, "n": e.KEY_N, "o": e.KEY_O,
@@ -342,9 +1113,11 @@ class LiveInputDaemon(Thread):
         if is_press:
             for code in codes:
                 self.uinput.write(e.EV_KEY, code, 1)
+                self.active_virtual_codes.add(code)
         else:
             for code in reversed(codes):
                 self.uinput.write(e.EV_KEY, code, 0)
+                self.active_virtual_codes.discard(code)
         self.uinput.syn()
 
     def run(self):
@@ -378,13 +1151,13 @@ class LiveInputDaemon(Thread):
                 r, w, x = select([mouse_dev.fileno()], [], [], 0.1)
                 if mouse_dev.fileno() in r:
                     for event in mouse_dev.read():
-                        bindings = self.get_bindings()
                         if event.type != evdev.ecodes.EV_KEY:
                             continue
                         
                         button_str = hardware_button_map.get(event.code, trinity_map.get(event.code))
-                        if button_str and button_str in bindings:
-                            target_action = bindings[button_str]
+                        if button_str:
+                            bindings = self.get_bindings()
+                            target_action = bindings.get(button_str)
                             if target_action:
                                 self.send_combo_uinput(target_action, event.value == 1)
         except Exception as err:
@@ -402,20 +1175,20 @@ def ensure_device_drivers():
         for hid_path in glob.glob("/sys/bus/hid/devices/0003:1532:*"):
             device_id = os.path.basename(hid_path)
             driver_link = os.path.join(hid_path, "driver")
+            driver_type = "razerkbd"
+            uevent_path = os.path.join(hid_path, "uevent")
+            with open(uevent_path, "r") as f:
+                device_info = f.read().lower()
+            if "mouse" in device_info or "naga" in device_info:
+                driver_type = "razermouse"
             if os.path.lexists(driver_link):
                 current_driver = os.path.basename(os.readlink(driver_link))
                 if current_driver in {"hid-generic", "hid"}:
-                    logger.info(f"Device {device_id} is bound to '{current_driver}'. Invoking helper...")
-                    subprocess.run(
-                        ["pkexec", "/usr/lib/openchroma/openchroma-helper", device_id, "razerkbd"],
-                        check=False
-                    )
+                    cmd = f"echo '{device_id}' > /sys/bus/hid/drivers/{current_driver}/unbind 2>/dev/null; echo '{device_id}' > /sys/bus/hid/drivers/{driver_type}/bind 2>/dev/null"
+                    subprocess.run(["pkexec", "sh", "-c", cmd], check=False)
     except Exception as e:
-        logger.error(f"Failed to check/bind device drivers: {e}")
+        logger.error(f"Failed to bind device drivers: {e}")
 
-# ==============================================================================
-# 4. MAIN GUI APPLICATION & SYNAPSE CONTROL PANEL
-# ==============================================================================
 class NagaSynapseApp(QWidget):
     def load_profiles(self):
         default_blueprints = {
@@ -432,13 +1205,15 @@ class NagaSynapseApp(QWidget):
                             if "bindings" not in v:
                                 data[k] = {"bindings": v, "dpi": 1800}
                             
-                            base = k.lower().replace(" ", "")
-                            if "pso2" in base:
-                                data[k]["aliases"] = ["pso2.exe", "pso2_bin/pso2.exe", "phantasy star online 2 new genesis", "new genesis"]
-                            elif "ffxiv" in base or "finalfantasy" in base:
-                                data[k]["aliases"] = ["ffxivgame.x64", "ffxiv.exe", "ffxiv", "final fantasy xiv", "final fantasy 14"]
-                            elif "aliases" not in data[k]:
-                                data[k]["aliases"] = [base + ".exe", base, k.lower()]
+                            # Ensure 'aliases' exists, but preserve what's already defined in JSON
+                            if "aliases" not in data[k]:
+                                base = k.lower().replace(" ", "")
+                                if "pso2" in base:
+                                    data[k]["aliases"] = ["pso2.exe", "pso2_bin/pso2.exe", "phantasy star online 2 new genesis", "new genesis"]
+                                elif "ffxiv" in base or "finalfantasy" in base:
+                                    data[k]["aliases"] = ["ffxivgame.x64", "ffxiv.exe", "ffxiv", "final fantasy xiv", "final fantasy 14", "final fantasy", "xiv"]
+                                else:
+                                    data[k]["aliases"] = [base + ".exe", base, k.lower()]
                     return data
             except Exception as e:
                 logger.error(f"Failed to load profiles from disk: {e}")
@@ -496,7 +1271,6 @@ class NagaSynapseApp(QWidget):
         self.profile_dropdowns = []
         self.initUI()
         self.update_detected_hardware_labels()
-        self.change_profile(0)
 
         self.bridge = SignalBridge()
         self.bridge.window_changed_signal.connect(self.handle_auto_window_switch)
@@ -511,6 +1285,8 @@ class NagaSynapseApp(QWidget):
             self.set_panel_view("12-button")
         else:
             self.set_panel_view("2-button")
+
+        self.change_profile(0)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -598,7 +1374,6 @@ class NagaSynapseApp(QWidget):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Device info card
         self.device_info_card = QFrame()
         self.device_info_card.setObjectName("CardFrame")
         info_layout = QHBoxLayout(self.device_info_card)
@@ -631,7 +1406,6 @@ class NagaSynapseApp(QWidget):
 
         self.tabs = QTabWidget()
         
-        # Customize Tab
         customize_tab = QWidget()
         customize_layout = QHBoxLayout(customize_tab)
         customize_layout.setContentsMargins(20, 20, 20, 20)
@@ -708,7 +1482,6 @@ class NagaSynapseApp(QWidget):
 
         customize_layout.addWidget(left_card, stretch=2)
 
-        # Right Panel - Keybindings & Mouse Functions
         right_card = QFrame()
         right_card.setObjectName("CardFrame")
         right_card_layout = QVBoxLayout(right_card)
@@ -749,17 +1522,14 @@ class NagaSynapseApp(QWidget):
 
         self.tabs.addTab(customize_tab, "CUSTOMIZE")
 
-        # Performance Tab
         perf_tab = self.build_performance_tab()
         self.tabs.addTab(perf_tab, "PERFORMANCE")
 
-        # Lighting Tab
         light_tab = self.build_lighting_tab()
         self.tabs.addTab(light_tab, "LIGHTING")
 
         main_layout.addWidget(self.tabs)
 
-        # --- Footer Layout (Autostart Checkbox) ---
         footer_layout = QHBoxLayout()
         footer_layout.setContentsMargins(15, 0, 15, 8)
         footer_layout.addStretch()
@@ -788,7 +1558,6 @@ class NagaSynapseApp(QWidget):
         self.setLayout(main_layout)
         self.setFixedSize(980, 600)
 
-        # --- System Tray Initialization ---
         self.tray_icon = QSystemTrayIcon(self)
         if os.path.exists(icon_path):
             pixmap = QPixmap(icon_path)
@@ -828,8 +1597,6 @@ class NagaSynapseApp(QWidget):
 
     def select_profile_from_tray(self, profile_name):
         self.sync_all_profile_dropdowns(profile_name)
-        self.change_profile(0)
-        logger.info(f"Switched profile to '{profile_name}' via system tray.")
 
     def handle_tray_activation(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -1044,36 +1811,95 @@ X-GNOME-Autostart-enabled=true
         card_layout.addSpacing(10)
 
         card_layout.addWidget(QLabel("<b style='color: #00ff00; font-size: 15px;'>CHROMA LIGHTING EFFECTS (INDEPENDENT)</b>"))
-        
         card_layout.addSpacing(5)
-        card_layout.addWidget(QLabel("<b>SELECT COLOR TARGET</b>"))
+
+        top_controls_layout = QHBoxLayout()
+        top_controls_layout.setContentsMargins(0, 0, 0, 0)
+        top_controls_layout.setSpacing(15)
+
+        target_card = QWidget()
+        target_card.setStyleSheet("background-color: #1a1a1a; border: 1px solid #333333; border-radius: 6px;")
+        target_layout = QVBoxLayout(target_card)
+        target_layout.setContentsMargins(10, 8, 10, 8)
+        target_layout.setSpacing(6)
         
-        target_layout = QHBoxLayout()
+        target_layout.addWidget(QLabel("<b style='color: #00ff00; font-size: 11px;'>COLOR TARGET</b>"))
+        target_btn_layout = QHBoxLayout()
+        target_btn_layout.setSpacing(6)
+        
         self.target_mouse_btn = QPushButton("Mouse")
         self.target_mouse_btn.setCheckable(True)
         self.target_mouse_btn.setChecked(True)
+        self.target_mouse_btn.setFixedHeight(30)
         self.target_mouse_btn.clicked.connect(lambda: self.set_color_target("mouse"))
         
         self.target_keyboard_btn = QPushButton("Keyboard")
         self.target_keyboard_btn.setCheckable(True)
+        self.target_keyboard_btn.setFixedHeight(30)
         self.target_keyboard_btn.clicked.connect(lambda: self.set_color_target("keyboard"))
         
-        target_layout.addWidget(self.target_mouse_btn)
-        target_layout.addWidget(self.target_keyboard_btn)
-        card_layout.addLayout(target_layout)
+        target_btn_layout.addWidget(self.target_mouse_btn)
+        target_btn_layout.addWidget(self.target_keyboard_btn)
+        target_layout.addLayout(target_btn_layout)
+        top_controls_layout.addWidget(target_card)
 
+        mode_card = QWidget()
+        mode_card.setStyleSheet("background-color: #1a1a1a; border: 1px solid #333333; border-radius: 6px;")
+        mode_layout = QVBoxLayout(mode_card)
+        mode_layout.setContentsMargins(10, 8, 10, 8)
+        mode_layout.setSpacing(6)
+        
+        mode_layout.addWidget(QLabel("<b style='color: #00ff00; font-size: 11px;'>LIGHTING MODE</b>"))
+        mode_btn_layout = QHBoxLayout()
+        mode_btn_layout.setSpacing(6)
+        
+        self.btn_preset_mode = QPushButton("Preset Effects")
+        self.btn_matrix_mode = QPushButton("Zone Paint Canvas")
+        self.btn_preset_mode.setCheckable(True)
+        self.btn_matrix_mode.setCheckable(True)
+        self.btn_preset_mode.setChecked(True)
+        self.btn_preset_mode.setFixedHeight(30)
+        self.btn_matrix_mode.setFixedHeight(30)
+        
+        mode_btn_layout.addWidget(self.btn_preset_mode)
+        mode_btn_layout.addWidget(self.btn_matrix_mode)
+        mode_layout.addLayout(mode_btn_layout)
+        top_controls_layout.addWidget(mode_card)
+
+        card_layout.addLayout(top_controls_layout)
         self.update_target_button_styles()
 
-        card_layout.addSpacing(10)
+        self.lighting_stack = QStackedLayout()
+
+        self.preset_widget_page = QWidget()
+        preset_page_layout = QHBoxLayout(self.preset_widget_page)
+        preset_page_layout.setContentsMargins(10, 10, 10, 10)
+        preset_page_layout.setSpacing(15)
+
+        left_col_widget = QWidget()
+        left_col_layout = QVBoxLayout(left_col_widget)
+        left_col_layout.setContentsMargins(0, 0, 0, 0)
+        left_col_layout.setSpacing(10)
+
+        left_col_layout.addWidget(QLabel("<b>EFFECT MODE</b>"))
+        
+        effect_layout = QHBoxLayout()
+        self.effect_combo = QComboBox()
+        self.effect_combo.addItems(["Static (Custom Color)", "Breathe"])
+        self.effect_combo.currentIndexChanged.connect(self.on_effect_mode_changed)
+        effect_layout.addWidget(self.effect_combo)
+        left_col_layout.addLayout(effect_layout)
+
+        left_col_layout.addSpacing(5)
         self.bright_label = QLabel("Brightness: <b>100%</b>")
-        card_layout.addWidget(self.bright_label)
+        left_col_layout.addWidget(self.bright_label)
         
         self.bright_slider = QSlider(Qt.Orientation.Horizontal)
         self.bright_slider.setMinimum(0)
         self.bright_slider.setMaximum(100)
         self.bright_slider.setValue(100)
         self.bright_slider.valueChanged.connect(self.on_brightness_changed)
-        card_layout.addWidget(self.bright_slider)
+        left_col_layout.addWidget(self.bright_slider)
 
         self.breathe_container = QWidget()
         breathe_layout = QVBoxLayout(self.breathe_container)
@@ -1113,55 +1939,119 @@ X-GNOME-Autostart-enabled=true
         breathe_layout.addWidget(self.breathe_speed_slider)
         
         self.breathe_container.hide()
-        card_layout.addWidget(self.breathe_container)
+        left_col_layout.addWidget(self.breathe_container)
+        left_col_layout.addStretch()
 
-        card_layout.addSpacing(10)
-        card_layout.addWidget(QLabel("<b>EFFECT MODE</b>"))
-        
-        effect_layout = QHBoxLayout()
-        self.effect_combo = QComboBox()
-        self.effect_combo.addItems(["Static (Custom Color)", "Breathe"])
-        self.effect_combo.currentIndexChanged.connect(self.on_effect_mode_changed)
-        effect_layout.addWidget(self.effect_combo)
-        effect_layout.addStretch()
-        card_layout.addLayout(effect_layout)
+        right_col_widget = QWidget()
+        right_col_layout = QVBoxLayout(right_col_widget)
+        right_col_layout.setContentsMargins(0, 0, 0, 0)
+        right_col_layout.setSpacing(8)
 
-        card_layout.addSpacing(10)
-        card_layout.addWidget(QLabel("<b>16M COLOR SPECTRUM GAMUT & HEX INPUT</b>"))
-
-        top_bar = QHBoxLayout()
-        self.color_preview_lbl = QLabel()
-        self.color_preview_lbl.setFixedSize(40, 28)
-        self.color_preview_lbl.setStyleSheet("background-color: #00ff00; border: 1px solid #555555; border-radius: 4px;")
-        top_bar.addWidget(self.color_preview_lbl)
-
-        top_bar.addWidget(QLabel("Hex Code:"))
-        self.hex_input = QLineEdit()
-        self.hex_input.setPlaceholderText("#00ff00")
-        self.hex_input.setText("#00ff00")
-        self.hex_input.setFixedWidth(110)
-        self.hex_input.returnPressed.connect(self.apply_color_from_hex)
-        top_bar.addWidget(self.hex_input)
-
-        apply_hex_btn = QPushButton("Apply Hex")
-        apply_hex_btn.clicked.connect(self.apply_color_from_hex)
-        top_bar.addWidget(apply_hex_btn)
-        top_bar.addStretch()
-        card_layout.addLayout(top_bar)
+        right_col_layout.addWidget(QLabel("<b>16M COLOR SPECTRUM GAMUT</b>"))
 
         self.spectrum_widget = GamutSpectrumWidget()
         self.spectrum_widget.colorSelected.connect(self.on_spectrum_color_picked)
-        card_layout.addWidget(self.spectrum_widget)
+        right_col_layout.addWidget(self.spectrum_widget)
+
+        top_bar = QHBoxLayout()
+        self.color_preview_lbl = QLabel()
+        self.color_preview_lbl.setFixedSize(35, 26)
+        self.color_preview_lbl.setStyleSheet("background-color: #00ff00; border: 1px solid #555555; border-radius: 4px;")
+        top_bar.addWidget(self.color_preview_lbl)
+
+        top_bar.addWidget(QLabel("Hex:"))
+        self.hex_input = QLineEdit()
+        self.hex_input.setPlaceholderText("#00ff00")
+        self.hex_input.setText("#00ff00")
+        self.hex_input.setFixedWidth(90)
+        self.hex_input.returnPressed.connect(self.apply_color_from_hex)
+        top_bar.addWidget(self.hex_input)
+
+        apply_hex_btn = QPushButton("Apply")
+        apply_hex_btn.setFixedHeight(28)
+        apply_hex_btn.clicked.connect(self.apply_color_from_hex)
+        top_bar.addWidget(apply_hex_btn)
+        top_bar.addStretch()
+        right_col_layout.addLayout(top_bar)
+        right_col_layout.addStretch()
+
+        preset_page_layout.addWidget(left_col_widget, stretch=1)
+        preset_page_layout.addWidget(right_col_widget, stretch=1)
+
+        self.matrix_paint_page = QWidget()
+        self.matrix_page_layout = QVBoxLayout(self.matrix_paint_page)
+        self.matrix_page_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.update_matrix_paint_widget(self.current_target)
+
+        self.lighting_stack.addWidget(self.preset_widget_page)
+        self.lighting_stack.addWidget(self.matrix_paint_page)
+        card_layout.addLayout(self.lighting_stack)
+
+        self.btn_preset_mode.clicked.connect(lambda: self.switch_lighting_mode("preset"))
+        self.btn_matrix_mode.clicked.connect(lambda: self.switch_lighting_mode("matrix"))
+        
+        self.update_mode_button_styles("preset")
 
         card_layout.addStretch()
         layout.addWidget(card)
         return tab
+
+    def switch_lighting_mode(self, mode):
+        if mode == "preset":
+            self.lighting_stack.setCurrentIndex(0)
+            self.update_mode_button_styles("preset")
+            self.on_effect_mode_changed(0)
+        else:
+            self.lighting_stack.setCurrentIndex(1)
+            self.update_mode_button_styles("matrix")
+            try:
+                self.razer.set_matrix_effect_custom(self.current_target)
+            except Exception as e:
+                logger.error(f"Failed to switch to custom matrix mode for {self.current_target}: {e}")
+            if hasattr(self, 'active_paint_widget') and self.active_paint_widget:
+                self.active_paint_widget.flush_frame()
+
+    def update_mode_button_styles(self, active_mode):
+        active_style = """
+            QPushButton {
+                background-color: #00ff00;
+                color: #000000;
+                border: 2px solid #00ff00;
+                font-weight: bold;
+                border-radius: 4px;
+                padding: 6px 14px;
+            }
+        """
+        inactive_style = """
+            QPushButton {
+                background-color: #181818;
+                color: #00ff00;
+                border: 2px solid #00ff00;
+                font-weight: bold;
+                border-radius: 4px;
+                padding: 6px 14px;
+            }
+            QPushButton:hover {
+                background-color: #222222;
+            }
+        """
+
+        if active_mode == "preset":
+            self.btn_preset_mode.setStyleSheet(active_style)
+            self.btn_matrix_mode.setStyleSheet(inactive_style)
+        else:
+            self.btn_preset_mode.setStyleSheet(inactive_style)
+            self.btn_matrix_mode.setStyleSheet(active_style)
 
     def set_color_target(self, target):
         self.current_target = target
         self.target_mouse_btn.setChecked(target == "mouse")
         self.target_keyboard_btn.setChecked(target == "keyboard")
         self.update_target_button_styles()
+        
+        if hasattr(self, 'matrix_page_layout'):
+            self.update_matrix_paint_widget(target)
         
         self.effect_combo.blockSignals(True)
         if target == "mouse":
@@ -1245,6 +2135,8 @@ X-GNOME-Autostart-enabled=true
 
         self.color_preview_lbl.setStyleSheet(f"background-color: {hex_str}; border: 1px solid #555555; border-radius: 4px;")
         self.apply_static_color_to_device(self.current_target, col.red(), col.green(), col.blue())
+        if hasattr(self, 'active_paint_widget'):
+            self.active_paint_widget.set_brush_color(col)
 
     def apply_color_from_hex(self):
         text = self.hex_input.text().strip()
@@ -1260,6 +2152,8 @@ X-GNOME-Autostart-enabled=true
 
             self.color_preview_lbl.setStyleSheet(f"background-color: {hex_str}; border: 1px solid #555555; border-radius: 4px;")
             self.apply_static_color_to_device(self.current_target, r, g, b)
+            if hasattr(self, 'active_paint_widget'):
+                self.active_paint_widget.set_brush_color(col)
         else:
             QMessageBox.warning(self, "Invalid Hex", f"Could not parse '{text}' as a valid hex color code. Use format #ff0000.")
 
@@ -1374,6 +2268,20 @@ X-GNOME-Autostart-enabled=true
             else:
                 btn.setStyleSheet("QPushButton { background-color: #222222; color: #888888; border: 1px solid #3a3a3a; font-weight: bold; border-radius: 6px; } QPushButton:hover { border: 1px solid #00ff00; color: #ffffff; }")
         self.update_ui_layout(panel_type)
+
+    def update_matrix_paint_widget(self, target):
+        while self.matrix_page_layout.count():
+            item = self.matrix_page_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        if target == "mouse":
+            self.active_paint_widget = MouseZoneWidget(self.razer)
+        else:
+            self.active_paint_widget = RazerGenieKeyboardWidget(self.razer, self) # Pass self here
+            
+        self.matrix_page_layout.addWidget(self.active_paint_widget, alignment=Qt.AlignmentFlag.AlignCenter)
 
     def update_ui_layout(self, panel_type):
         while self.container_layout.count():
@@ -1658,11 +2566,21 @@ X-GNOME-Autostart-enabled=true
         return "Default Profile"
 
     def sync_all_profile_dropdowns(self, profile_name):
+        valid_combos = []
+        for combo in getattr(self, 'profile_dropdowns', []):
+            try:
+                _ = combo.isVisible()
+                valid_combos.append(combo)
+            except RuntimeError:
+                pass
+        self.profile_dropdowns = valid_combos
+
         for combo in self.profile_dropdowns:
             combo.blockSignals(True)
-            combo.setCurrentText(profile_name)
+            idx = combo.findText(profile_name)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
             combo.blockSignals(False)
-        self.update_tray_profile_menu()
 
     def handle_dropdown_profile_change(self, index):
         sender_combo = self.sender()
@@ -1744,6 +2662,13 @@ X-GNOME-Autostart-enabled=true
     def save_to_disk(self):
         self.save_current_binding()
         
+        curr_prof = self.get_active_profile_name()
+        if curr_prof in self.profiles and isinstance(self.profiles[curr_prof], dict):
+            if "matrix" not in self.profiles[curr_prof]:
+                self.profiles[curr_prof]["matrix"] = {}
+            if hasattr(self, 'active_paint_widget') and hasattr(self.active_paint_widget, 'color_buffer'):
+                self.profiles[curr_prof]["matrix"][self.current_target] = self.active_paint_widget.color_buffer
+        
         for profile_name, profile_data in self.profiles.items():
             if isinstance(profile_data, dict):
                 base = profile_name.lower().replace(" ", "")
@@ -1773,13 +2698,16 @@ X-GNOME-Autostart-enabled=true
         self.update_button_visuals()
 
         prof_data = self.profiles.get(profile_name, {})
-        if isinstance(prof_data, dict) and "dpi" in prof_data:
-            target_dpi = prof_data["dpi"]
-            self.dpi_slider.blockSignals(True)
-            self.dpi_slider.setValue(target_dpi)
-            self.dpi_slider.blockSignals(False)
-            self.dpi_label.setText(f"Current DPI: <b>{target_dpi}</b> (Profile Preset)")
-            self._apply_hw_dpi(target_dpi)
+        if isinstance(prof_data, dict):
+            if "dpi" in prof_data:
+                target_dpi = prof_data["dpi"]
+                self.dpi_slider.blockSignals(True)
+                self.dpi_slider.setValue(target_dpi)
+                self.dpi_slider.blockSignals(False)
+                self.dpi_label.setText(f"Current DPI: <b>{target_dpi}</b> (Profile Preset)")
+                self._apply_hw_dpi(target_dpi)
+            if "matrix" in prof_data and hasattr(self, 'active_paint_widget') and self.current_target in prof_data["matrix"]:
+                self.active_paint_widget.load_frame(prof_data["matrix"][self.current_target])
 
     def create_profile(self):
         text, ok = QInputDialog.getText(self, 'New Profile', 'Enter name:')
@@ -1872,9 +2800,8 @@ X-GNOME-Autostart-enabled=true
                 QMessageBox.critical(self, "Error", f"Failed to import profiles: {e}")
 
 if __name__ == '__main__':
-    ensure_device_drivers()  # Check and bind drivers first
+    ensure_device_drivers()
     
-    # Dynamic session check: Native Wayland on Wayland sessions, fallback to xcb on X11
     session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
     if session_type == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
         if "XDG_RUNTIME_DIR" not in os.environ:
