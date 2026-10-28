@@ -11,24 +11,25 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
 
-      - name: Install system dependencies
+      - name: Install system dependencies & Python packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev libglib2.0-dev python3-dbus pkg-config build-essential
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          sudo apt-get install -y \
+            python3-full \
+            python3-pip \
+            python3-pyqt6 \
+            python3-evdev \
+            python3-xlib \
+            python3-dbus \
+            python3-openrgb \
+            libdbus-1-dev \
+            pkg-config \
+            build-essential
 
       - name: Build Standalone Executable
         run: |
+          pip install pyinstaller --break-system-packages
           pyinstaller --name openchroma --onefile --windowed --add-data "assets:assets" openchroma
 
       - name: Create Release and Upload Binary
