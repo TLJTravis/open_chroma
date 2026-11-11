@@ -14,7 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clean process signal handling (`SIGINT`/`SIGTERM`).
 ---
 
-## Keyboard/Mouse editor US/UI upgrades & fixes for bugs in those modules - 2026-10-28
+## [1.0.9] - Launch Lighting & Window Alias Fixes - 2026-11-11
+
+### Fixed
+- **Launch Lighting Initialization:** Resolved a bug where connected keyboards and mice failed to light up or apply active lighting profiles automatically upon application startup.
+- **Bottles Window Alias Recognition:** Fixed window tracking logic to properly detect and resolve application window aliases running inside Bottles environments.
+- **Profile Activity Filtering:** Corrected auto-profile switching behavior to prevent improper window aliases and background process titles from web browsers and Discord from triggering incorrect lighting profiles.
+
+---
+
+## [1.0.8] - Keyboard/Mouse editor US/UI upgrades & fixes for bugs in those modules - 2026-10-28
 
 ### Added
 - **Keyboard Matrix Grid & Paint Canvas:** Implemented per-key 6x22 matrix RGB lighting editor, visual painting canvas, color gamut color picker, and real-time hardware flushing.
@@ -26,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Editor Initialization:** Resolved initial launch state so the editor starts up clean without pre-selecting or prematurely highlighting keys.
 - **Mouse Logo Highlight Alignment:** Adjusted `MouseZoneWidget` Y-coordinate positioning (fine-tuned to `85`) to ensure the interactive highlight box aligns cleanly over the Naga Trinity logo graphic.
 ---
+
 ## Keyboard Matrix & Mouse Lighting(basic)m Fixed Editor memory &initialization - 2026-10-27
 
 ### Added
