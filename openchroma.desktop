@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=OpenChroma Controls
-Exec=open_chroma
+Exec= python3 /usr/share/openchroma/openchroma
 Icon=openchroma
 Type=Application
 Categories=Utility;Settings;
