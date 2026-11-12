@@ -46,6 +46,29 @@ class RazerBackend:
         if self.error:
             logger.warning(self.error)
 
+    def set_matrix_effect_custom(self, kind: str) -> bool:
+        dev = self.devices.get(kind)
+        if not dev or not self.has(kind, "lighting_custom"):
+            return False
+        try:
+            dev.fx.custom()
+            return True
+        except Exception as e:
+            logger.warning("set_matrix_effect_custom(%s) failed: %s", kind, e)
+            return False
+
+    def set_matrix_custom_frame(self, kind: str, matrix) -> bool:
+        dev = self.devices.get(kind)
+        if not dev or not self.has(kind, "lighting_custom"):
+            return False
+        try:
+            dev.fx.advanced.matrix = matrix
+            dev.fx.advanced.draw()
+            return True
+        except Exception as e:
+            logger.warning("set_matrix_custom_frame(%s) failed: %s", kind, e)
+            return False
+            
     def name(self, kind: str) -> str:
         dev = self.devices.get(kind)
         return dev.name if dev else f"No {kind} found"
