@@ -37,9 +37,18 @@ class RazerBackend:
             manager = DeviceManager()
             manager.sync_effects = False  # keyboard and mouse get independent effects
             for dev in manager.devices:
-                kind = "keyboard" if dev.type == "keyboard" else "mouse" if dev.type == "mouse" else None
+                dev_type = getattr(dev, "type", "").lower()
+                dev_name = getattr(dev, "name", "").lower()
+                
+                kind = None
+                if "keyboard" in dev_type or any(k in dev_name for k in ["ornata", "blackwidow", "huntsman", "deathstalker", "keyboard"]):
+                    kind = "keyboard"
+                elif "mouse" in dev_type or any(m in dev_name for m in ["naga", "deathadder", "basilisk", "viper", "mouse"]):
+                    kind = "mouse"
+                
                 if kind and self.devices[kind] is None:
                     self.devices[kind] = dev
+                    logger.info(f"Discovered Razer {kind}: {dev.name}")
             self._manager = manager  # keep alive so D-Bus signals stay connected
         except Exception as e:  # DaemonNotFoundError and D-Bus errors
             self.error = f"openrazer-daemon not reachable: {e}"
@@ -62,7 +71,13 @@ class RazerBackend:
         if not dev or not self.has(kind, "lighting_custom"):
             return False
         try:
-            dev.fx.advanced.matrix = matrix
+            # Ensure matrix rows are formatted as tuples for the openrazer backend
+            if isinstance(matrix, list):
+                formatted_matrix = [tuple(row) for row in matrix]
+            else:
+                formatted_matrix = matrix
+
+            dev.fx.advanced.matrix = formatted_matrix
             dev.fx.advanced.draw()
             return True
         except Exception as e:
@@ -125,6 +140,7 @@ class RazerBackend:
         level = max(0, min(100, int(percent)))
         self._level[kind] = level
         try:
+            # FIX: Change self.software_mdim to self.software_dim
             if kind in self.software_dim:
                 dev.brightness = 100  # keep the device at full so dimming is not applied twice
                 return self.set_static(kind, *self._color[kind])

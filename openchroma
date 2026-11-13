@@ -67,7 +67,6 @@ from PyQt6.QtWidgets import (
 
 try:
   import dbus
-
   HAS_DBUS = True
 except ImportError:
   HAS_DBUS = False
@@ -169,6 +168,7 @@ class DpiOsdOverlay(QLabel):
         | Qt.WindowType.Tool
         | Qt.WindowType.WindowDoesNotAcceptFocus
     )
+
     self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
     self.setStyleSheet("""
@@ -1220,28 +1220,31 @@ class KeyboardEditorDialog(QDialog):
 
   def flush_frame(self):
     try:
-      try:
-        self.razer.set_matrix_effect_custom(self.target)
-      except Exception as e:
-        logger.error(f"Failed to set custom matrix effect: {e}")
+      import openrazer.client
+      device_manager = openrazer.client.DeviceManager()
+      for device in device_manager.devices:
+        if device.type == 'keyboard':
+          matrix = [[(0, 0, 0) for _ in range(22)] for _ in range(6)]
 
-      matrix = [[(0, 0, 0) for _ in range(22)] for _ in range(6)]
+          for key_name, rgb in self.color_buffer.items():
+            if key_name in self.coords:
+              info = self.coords[key_name]
+              r_idx = info[0]
+              c_start = info[1]
+              c_end = info[2]
+              r_end = info[3] if len(info) > 3 else r_idx
+              color_tuple = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+              for r in range(r_idx, r_end + 1):
+                for c in range(c_start, c_end + 1):
+                  if 0 <= r < 6 and 0 <= c < 22:
+                    matrix[r][c] = color_tuple
 
-      for key_name, rgb in self.color_buffer.items():
-        if key_name in self.coords:
-          info = self.coords[key_name]
-          r_idx = info[0]
-          c_start = info[1]
-          c_end = info[2]
-          r_end = info[3] if len(info) > 3 else r_idx
-          color_tuple = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
-          for r in range(r_idx, r_end + 1):
-            for c in range(c_start, c_end + 1):
-              if 0 <= r < 6 and 0 <= c < 22:
-                matrix[r][c] = color_tuple
+          for r_idx, row in enumerate(matrix):
+            for c_idx, color in enumerate(row):
+              device.fx.advanced.matrix[r_idx, c_idx] = color
 
-      matrix_tuples = [tuple(row) for row in matrix]
-      self.razer.set_matrix_custom_frame(self.target, matrix_tuples)
+          device.fx.advanced.draw()
+          break
     except Exception as e:
       logger.error(f"Keyboard custom frame flush error: {e}")
 
@@ -1377,6 +1380,7 @@ class RazerGenieKeyboardWidget(QWidget):
     try:
       try:
         self.razer.set_matrix_effect_custom("keyboard")
+        time.sleep(0.02)
       except Exception as e:
         logger.error(f"Failed to set keyboard custom matrix effect: {e}")
 
@@ -1924,8 +1928,19 @@ class NagaSynapseApp(QWidget):
         logger.error(f"Failed to load profiles from disk: {e}")
     return default_blueprints
 
-  def apply_startup_lighting_buffers(self):
-      """Pushes saved profile custom matrix lighting directly to hardware on startup/switch."""
+  def apply_default_profile(self):
+      return self.apply_startup_lighting_buffers()
+
+  def apply_startup_lighting_buffers(self, retry_count=0):
+      if not self.razer.devices.get("keyboard") and not self.razer.devices.get("mouse"):
+          if retry_count < 10:
+              logger.warning(f"Razer devices not ready (attempt {retry_count}/10), retrying...")
+              QTimer.singleShot(1000, lambda: self.apply_startup_lighting_buffers(retry_count + 1))
+              return
+          else:
+              logger.error("Timed out waiting for Razer devices on startup.")
+              return
+          
       curr_prof = self.get_active_profile_name()
       prof_data = self.profiles.get(curr_prof, {})
       if not isinstance(prof_data, dict) or "matrix" not in prof_data:
@@ -1933,62 +1948,16 @@ class NagaSynapseApp(QWidget):
 
       matrix_dict = prof_data["matrix"]
 
-      # 1. Apply Keyboard Matrix Buffer if saved
       if "keyboard" in matrix_dict and matrix_dict["keyboard"]:
         try:
-          self.razer.set_matrix_effect_custom("keyboard")
-          matrix = [[(0, 0, 0) for _ in range(22)] for _ in range(6)]
-          
-          # Reuse standard keyboard coordinates map
-          coords = {
-              "Esc": (0, 0, 0), "F1": (0, 2, 2), "F2": (0, 3, 3), "F3": (0, 4, 4),
-              "F4": (0, 5, 5), "F5": (0, 6, 6), "F6": (0, 7, 7), "F7": (0, 8, 8),
-              "F8": (0, 9, 9), "F9": (0, 10, 10), "F10": (0, 11, 11), "F11": (0, 12, 12),
-              "F12": (0, 13, 13), "PrtSc": (0, 15, 15), "ScrollLock": (0, 16, 16), "Pause": (0, 17, 17),
-              "`": (1, 0, 0), "1": (1, 1, 1), "2": (1, 2, 2), "3": (1, 3, 3), "4": (1, 4, 4),
-              "5": (1, 5, 5), "6": (1, 6, 6), "7": (1, 7, 7), "8": (1, 8, 8), "9": (1, 9, 9),
-              "0": (1, 10, 10), "-": (1, 11, 11), "=": (1, 12, 12), "Backspace": (1, 13, 14),
-              "Ins": (1, 15, 15), "Home": (1, 16, 16), "PgUp": (1, 17, 17), "NumLock": (1, 18, 18),
-              "Num_/": (1, 19, 19), "Num_*": (1, 20, 20), "Num_-": (1, 21, 21),
-              "Tab": (2, 0, 1), "Q": (2, 2, 2), "W": (2, 3, 3), "E": (2, 4, 4), "R": (2, 5, 5),
-              "T": (2, 6, 6), "Y": (2, 7, 7), "U": (2, 8, 8), "I": (2, 9, 9), "O": (2, 10, 10),
-              "P": (2, 11, 11), "[": (2, 12, 12), "]": (2, 13, 13), "\\": (2, 14, 15),
-              "Del": (2, 15, 15), "End": (2, 16, 16), "PgDn": (2, 17, 17),
-              "Num_7": (2, 18, 18), "Num_8": (2, 19, 19), "Num_9": (2, 20, 20), "Num_+": (2, 21, 21, 3, 21),
-              "Caps": (3, 0, 1), "A": (3, 2, 2), "S": (3, 3, 3), "D": (3, 4, 4), "F": (3, 5, 5),
-              "G": (3, 6, 6), "H": (3, 7, 7), "J": (3, 8, 8), "K": (3, 9, 9), "L": (3, 10, 10),
-              ";": (3, 11, 11), "'": (3, 12, 12), "Enter": (3, 13, 14),
-              "Num_4": (3, 18, 18), "Num_5": (3, 19, 19), "Num_6": (3, 20, 20),
-              "Shift": (4, 0, 2), "Z": (4, 3, 3), "X": (4, 4, 4), "C": (4, 5, 5), "V": (4, 6, 6),
-              "B": (4, 7, 7), "N": (4, 8, 8), "M": (4, 9, 9), ",": (4, 10, 10), ".": (4, 11, 11),
-              "/": (4, 12, 12), "RShift": (4, 13, 15), "↑": (4, 16, 16),
-              "Num_1": (4, 18, 18), "Num_2": (4, 19, 19), "Num_3": (4, 20, 20), "Num_Enter": (4, 21, 21, 5, 21),
-              "Ctrl": (5, 0, 0), "Win": (5, 1, 1), "Alt": (5, 2, 2), "Space": (5, 5, 9),
-              "RAlt": (5, 11, 11), "Fn": (5, 12, 12), "Menu": (5, 13, 13), "RCtrl": (5, 14, 14),
-              "←": (5, 15, 15), "↓": (5, 16, 16), "→": (5, 17, 17),
-              "Num_0": (5, 18, 19), "Num_.": (5, 20, 20)
-          }
-
-          for key_name, rgb in matrix_dict["keyboard"].items():
-            if key_name in coords:
-              info = coords[key_name]
-              r_idx, c_start, c_end = info[0], info[1], info[2]
-              r_end = info[3] if len(info) > 3 else r_idx
-              color_tuple = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
-              for r in range(r_idx, r_end + 1):
-                for c in range(c_start, c_end + 1):
-                  if 0 <= r < 6 and 0 <= c < 22:
-                    matrix[r][c] = color_tuple
-
-          self.razer.set_matrix_custom_frame("keyboard", [tuple(row) for row in matrix])
+          self.restore_keyboard_matrix_buffer(matrix_dict["keyboard"])
         except Exception as e:
           logger.error(f"Startup keyboard lighting sync error: {e}")
 
-      # 2. Apply Mouse Zone Buffer if saved
       if "mouse" in matrix_dict and matrix_dict["mouse"]:
         try:
           mouse_buffer = matrix_dict["mouse"]
-          # If using OpenRGB or openrazer backend for mouse zones
+          self.restore_mouse_zones_buffer(mouse_buffer)
           if hasattr(self, "active_paint_widget") and hasattr(self.active_paint_widget, "load_frame"):
             self.active_paint_widget.load_frame(mouse_buffer)
         except Exception as e:
@@ -2047,6 +2016,10 @@ class NagaSynapseApp(QWidget):
     self.dpi_stages = [300, 800, 1800, 3200, 4800, 6400, 7600, 9200, 12000]
     self.current_dpi_index = 2
     self.osd = DpiOsdOverlay()
+    
+    self.profile_dropdowns = []
+    self.initUI()
+    self.update_detected_hardware_labels()
 
     self.master_breathe_timer = QTimer(self)
     self.master_breathe_timer.timeout.connect(
@@ -2054,11 +2027,6 @@ class NagaSynapseApp(QWidget):
     )
     self.master_breathe_timer.start(40)
 
-    self.profile_dropdowns = []
-    self.initUI()
-    self.update_detected_hardware_labels()
-
-    # Qt Event-Loop QTimer Window Switcher
     self.profile_timer = QTimer(self)
     self.profile_timer.timeout.connect(self.poll_active_window)
     self.profile_timer.start(1500)
@@ -2074,8 +2042,7 @@ class NagaSynapseApp(QWidget):
       self.set_panel_view("2-button")
 
     self.change_profile(0)
-
-    QTimer.singleShot(200, self.apply_startup_lighting_buffers)
+    QTimer.singleShot(2500, self.apply_startup_lighting_buffers)
 
   def get_active_window_info(self):
     wm_class = ""
@@ -2284,7 +2251,7 @@ class NagaSynapseApp(QWidget):
     self.set_exact_dpi_preset(closest_dpi, trigger_osd=False)
 
   def initUI(self):
-    self.setWindowTitle("OpenChroma Controls (Universal - 1.0.9)")
+    self.setWindowTitle("OpenChroma Controls (Universal - 1.0.8)")
 
     icon_path = get_asset_path("OpenChroma.png")
     if os.path.exists(icon_path):
@@ -2905,6 +2872,7 @@ X-GNOME-Autostart-enabled=true
     effect_layout = QHBoxLayout()
     self.effect_combo = QComboBox()
     self.effect_combo.addItems([
+        "Custom Lighting",
         "Static (Custom Color)",
         "Breathe",
         "Two-Color Breathe",
@@ -3102,6 +3070,7 @@ X-GNOME-Autostart-enabled=true
       self.update_mode_button_styles("matrix")
       try:
         self.razer.set_matrix_effect_custom(self.current_target)
+        time.sleep(0.02)
       except Exception as e:
         logger.error(
             "Failed to switch to custom matrix mode for"
@@ -3288,6 +3257,7 @@ X-GNOME-Autostart-enabled=true
       self.effect_combo.setEnabled(True)
       self.effect_combo.clear()
       self.effect_combo.addItems([
+          "Custom Lighting",
           "Static (Custom Color)",
           "Breathe",
           "Two-Color Breathe",
@@ -3378,12 +3348,30 @@ X-GNOME-Autostart-enabled=true
     st = self.device_states[self.current_target]
     st["effect"] = effect_name
 
-    is_animated = effect_name in [
-        "Breathe",
-        "Two-Color Breathe",
-        "Spectrum Cycling",
-        "Wave",
-    ]
+    is_animated = effect_name in ["Breathe", "Two-Color Breathe", "Spectrum Cycling", "Wave"]
+
+    if effect_name == "Custom Lighting" or is_animated:
+      if self.current_target == "keyboard":
+        try:
+          self.razer.set_matrix_effect_custom("keyboard")
+          time.sleep(0.02)
+        except Exception as e:
+          logger.error(f"Failed to enable matrix mode: {e}")
+
+    if effect_name == "Custom Lighting":
+      if self.current_target == "keyboard":
+        if hasattr(self, "lighting_stack") and self.lighting_stack.currentIndex() != 1:
+          self.lighting_stack.setCurrentIndex(1)
+          self.update_mode_button_styles("matrix")
+
+        current_prof = self.get_active_profile_name()
+        kb_buffer = self.profiles.get(current_prof, {}).get("matrix", {}).get("keyboard", {})
+
+        if kb_buffer:
+          self.restore_keyboard_matrix_buffer(kb_buffer)
+          if hasattr(self, "active_paint_widget") and hasattr(self.active_paint_widget, "load_frame"):
+            self.active_paint_widget.load_frame(kb_buffer)
+      return
 
     if self.current_target == "mouse" and is_animated:
       self.effect_combo.blockSignals(True)
@@ -3396,24 +3384,9 @@ X-GNOME-Autostart-enabled=true
     if is_animated:
       if effect_name in ["Breathe", "Two-Color Breathe"]:
         st["breathe_val"] = st["breathe_min"]
-      self.razer.set_static(
-          self.current_target, col.red(), col.green(), col.blue()
-      )
     else:
-      self.razer.set_static(
-          self.current_target, col.red(), col.green(), col.blue()
-      )
+      self.razer.set_static(self.current_target, col.red(), col.green(), col.blue())
       self.razer.set_brightness(self.current_target, st["brightness"])
-
-      if self.current_target == "keyboard":
-        current_prof = self.get_active_profile_name()
-        if (
-            current_prof in self.profiles
-            and "matrix" in self.profiles[current_prof]
-        ):
-          kb_buffer = self.profiles[current_prof]["matrix"].get("keyboard", {})
-          if kb_buffer:
-            self.restore_keyboard_matrix_buffer(kb_buffer)
 
     QTimer.singleShot(0, self.refresh_lighting_ui_from_state)
 
@@ -3702,131 +3675,65 @@ X-GNOME-Autostart-enabled=true
       logger.error(f"Animation frame error: {e}")
 
   def restore_keyboard_matrix_buffer(self, kb_buffer):
-    try:
-      self.razer.set_matrix_effect_custom("keyboard")
-      matrix = [[(0, 0, 0) for _ in range(22)] for _ in range(6)]
+        try:
+            # Set the custom mode using the wrapper just in case
+            if hasattr(self, "razer") and hasattr(self.razer, "set_matrix_effect_custom"):
+                self.razer.set_matrix_effect_custom("keyboard")
+            import time
+            time.sleep(0.02)
+            
+            coords = {
+                "Esc": (0, 0, 0), "F1": (0, 2, 2), "F2": (0, 3, 3), "F3": (0, 4, 4),
+                "F4": (0, 5, 5), "F5": (0, 6, 6), "F6": (0, 7, 7), "F7": (0, 8, 8),
+                "F8": (0, 9, 9), "F9": (0, 10, 10), "F10": (0, 11, 11), "F11": (0, 12, 12),
+                "F12": (0, 13, 13), "PrtSc": (0, 15, 15), "ScrollLock": (0, 16, 16), "Pause": (0, 17, 17),
+                "`": (1, 0, 0), "1": (1, 1, 1), "2": (1, 2, 2), "3": (1, 3, 3), "4": (1, 4, 4),
+                "5": (1, 5, 5), "6": (1, 6, 6), "7": (1, 7, 7), "8": (1, 8, 8), "9": (1, 9, 9),
+                "0": (1, 10, 10), "-": (1, 11, 11), "=": (1, 12, 12), "Backspace": (1, 13, 14),
+                "Ins": (1, 15, 15), "Home": (1, 16, 16), "PgUp": (1, 17, 17), "NumLock": (1, 18, 18),
+                "Num_/": (1, 19, 19), "Num_*": (1, 20, 20), "Num_-": (1, 21, 21),
+                "Tab": (2, 0, 1), "Q": (2, 2, 2), "W": (2, 3, 3), "E": (2, 4, 4), "R": (2, 5, 5),
+                "T": (2, 6, 6), "Y": (2, 7, 7), "U": (2, 8, 8), "I": (2, 9, 9), "O": (2, 10, 10),
+                "P": (2, 11, 11), "[": (2, 12, 12), "]": (2, 13, 13), "\\": (2, 14, 15),
+                "Del": (2, 15, 15), "End": (2, 16, 16), "PgDn": (2, 17, 17),
+                "Num_7": (2, 18, 18), "Num_8": (2, 19, 19), "Num_9": (2, 20, 20), "Num_+": (2, 21, 21, 3, 21),
+                "Caps": (3, 0, 1), "A": (3, 2, 2), "S": (3, 3, 3), "D": (3, 4, 4), "F": (3, 5, 5),
+                "G": (3, 6, 6), "H": (3, 7, 7), "J": (3, 8, 8), "K": (3, 9, 9), "L": (3, 10, 10),
+                ";": (3, 11, 11), "'": (3, 12, 12), "Enter": (3, 13, 14),
+                "Num_4": (3, 18, 18), "Num_5": (3, 19, 19), "Num_6": (3, 20, 20),
+                "Shift": (4, 0, 2), "Z": (4, 3, 3), "X": (4, 4, 4), "C": (4, 5, 5), "V": (4, 6, 6),
+                "B": (4, 7, 7), "N": (4, 8, 8), "M": (4, 9, 9), ",": (4, 10, 10), ".": (4, 11, 11),
+                "/": (4, 12, 12), "RShift": (4, 13, 15), "↑": (4, 16, 16),
+                "Num_1": (4, 18, 18), "Num_2": (4, 19, 19), "Num_3": (4, 20, 20), "Num_Enter": (4, 21, 21, 5, 21),
+                "Ctrl": (5, 0, 0), "Win": (5, 1, 1), "Alt": (5, 2, 2), "Space": (5, 5, 9),
+                "RAlt": (5, 11, 11), "Fn": (5, 12, 12), "Menu": (5, 13, 13), "RCtrl": (5, 14, 14),
+                "←": (5, 15, 15), "↓": (5, 16, 16), "→": (5, 17, 17),
+                "Num_0": (5, 18, 19), "Num_.": (5, 20, 20)
+            }
+            
+            # The exact direct connection that you just proved works!
+            import openrazer.client
+            device_manager = openrazer.client.DeviceManager()
+            for device in device_manager.devices:
+                if device.type == 'keyboard':
+                    for key_name, rgb in kb_buffer.items():
+                        if key_name in coords:
+                            info = coords[key_name]
+                            r_idx, c_start, c_end = info[0], info[1], info[2]
+                            r_end = info[3] if len(info) > 3 else r_idx
+                            color_tuple = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+                            
+                            for r in range(r_idx, r_end + 1):
+                                for c in range(c_start, c_end + 1):
+                                    if 0 <= r < 6 and 0 <= c < 22:
+                                        device.fx.advanced.matrix[r, c] = color_tuple
+                                        
+                    # The vital draw command that pushes it to the Ornata V2
+                    device.fx.advanced.draw()
+                    break 
 
-      coords = {
-          "Esc": (0, 0, 0),
-          "F1": (0, 2, 2),
-          "F2": (0, 3, 3),
-          "F3": (0, 4, 4),
-          "F4": (0, 5, 5),
-          "F5": (0, 6, 6),
-          "F6": (0, 7, 7),
-          "F8": (0, 9, 9),
-          "F9": (0, 10, 10),
-          "F10": (0, 11, 11),
-          "F11": (0, 12, 12),
-          "F12": (0, 13, 13),
-          "PrtSc": (0, 15, 15),
-          "ScrollLock": (0, 16, 16),
-          "Pause": (0, 17, 17),
-          "`": (1, 0, 0),
-          "1": (1, 1, 1),
-          "2": (1, 2, 2),
-          "3": (1, 3, 3),
-          "4": (1, 4, 4),
-          "5": (1, 5, 5),
-          "6": (1, 6, 6),
-          "7": (1, 7, 7),
-          "8": (1, 8, 8),
-          "9": (1, 9, 9),
-          "0": (1, 10, 10),
-          "-": (1, 11, 11),
-          "=": (1, 12, 12),
-          "Backspace": (1, 13, 14),
-          "Ins": (1, 15, 15),
-          "Home": (1, 16, 16),
-          "PgUp": (1, 17, 17),
-          "NumLock": (1, 18, 18),
-          "Num_/": (1, 19, 19),
-          "Num_*": (1, 20, 20),
-          "Num_-": (1, 21, 21),
-          "Tab": (2, 0, 1),
-          "Q": (2, 2, 2),
-          "W": (2, 3, 3),
-          "E": (2, 4, 4),
-          "R": (2, 5, 5),
-          "T": (2, 6, 6),
-          "Y": (2, 7, 7),
-          "U": (2, 8, 8),
-          "I": (2, 9, 9),
-          "O": (2, 10, 10),
-          "P": (2, 11, 11),
-          "[": (2, 12, 12),
-          "]": (2, 13, 13),
-          "\\": (2, 14, 15),
-          "Del": (2, 15, 15),
-          "End": (2, 16, 16),
-          "PgDn": (2, 17, 17),
-          "Num_7": (2, 18, 18),
-          "Num_8": (2, 19, 19),
-          "Num_9": (2, 20, 20),
-          "Num_+": (2, 21, 21, 3, 21),
-          "Caps": (3, 0, 1),
-          "A": (3, 2, 2),
-          "S": (3, 3, 3),
-          "D": (3, 4, 4),
-          "F": (3, 5, 5),
-          "G": (3, 6, 6),
-          "H": (3, 7, 7),
-          "J": (3, 8, 8),
-          "K": (3, 9, 9),
-          "L": (3, 10, 10),
-          ";": (3, 11, 11),
-          "'": (3, 12, 12),
-          "Enter": (3, 13, 14),
-          "Num_4": (3, 18, 18),
-          "Num_5": (3, 19, 19),
-          "Num_6": (3, 20, 20),
-          "Shift": (4, 0, 2),
-          "Z": (4, 3, 3),
-          "X": (4, 4, 4),
-          "C": (4, 5, 5),
-          "V": (4, 6, 6),
-          "B": (4, 7, 7),
-          "N": (4, 8, 8),
-          "M": (4, 9, 9),
-          ",": (4, 10, 10),
-          ".": (4, 11, 11),
-          "/": (4, 12, 12),
-          "RShift": (4, 13, 15),
-          "↑": (4, 16, 16),
-          "Num_1": (4, 18, 18),
-          "Num_2": (4, 19, 19),
-          "Num_3": (4, 20, 20),
-          "Num_Enter": (4, 21, 21, 5, 21),
-          "Ctrl": (5, 0, 0),
-          "Win": (5, 1, 1),
-          "Alt": (5, 2, 2),
-          "Space": (5, 5, 9),
-          "RAlt": (5, 11, 11),
-          "Fn": (5, 12, 12),
-          "Menu": (5, 13, 13),
-          "RCtrl": (5, 14, 14),
-          "←": (5, 15, 15),
-          "↓": (5, 16, 16),
-          "→": (5, 17, 17),
-          "Num_0": (5, 18, 19),
-          "Num_.": (5, 20, 20),
-      }
-
-      for key_name, rgb in kb_buffer.items():
-        if key_name in coords:
-          info = coords[key_name]
-          r_idx, c_start, c_end = info[0], info[1], info[2]
-          r_end = info[3] if len(info) > 3 else r_idx
-          color_tuple = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
-          for r in range(r_idx, r_end + 1):
-            for c in range(c_start, c_end + 1):
-              if 0 <= r < 6 and 0 <= c < 22:
-                matrix[r][c] = color_tuple
-
-      matrix_tuples = [tuple(row) for row in matrix]
-      self.razer.set_matrix_custom_frame("keyboard", matrix_tuples)
-    except Exception as e:
-      logger.error(f"Failed to restore custom keyboard buffer: {e}")
+        except Exception as e:
+            print(f"Bypass failed: {e}")
 
   def on_brightness_changed(self, value):
     self.bright_label.setText(f"Brightness: <b>{value}%</b>")
@@ -4379,40 +4286,188 @@ X-GNOME-Autostart-enabled=true
         self, "Success", "Layout profiles and DPI settings successfully updated."
     )
 
+  def restore_mouse_zones_buffer(self, mouse_buffer):
+    try:
+      if hasattr(self, "active_paint_widget") and isinstance(self.active_paint_widget, MouseZoneWidget):
+        self.active_paint_widget.load_frame(mouse_buffer)
+        self.active_paint_widget.flush_frame()
+        return
+
+      from openrgb import OpenRGBClient
+      from openrgb.utils import RGBColor
+      client = OpenRGBClient("127.0.0.1", 6742, timeout=2)
+      devices = client.get_devices_by_name("Razer Naga Trinity")
+      if devices:
+        rgb_mouse = devices[0]
+        for idx, rgb in enumerate(mouse_buffer):
+          if idx < len(rgb_mouse.zones):
+            color_obj = RGBColor(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+            for led in rgb_mouse.zones[idx].leds:
+              led.set_color(color_obj)
+        rgb_mouse.show()
+    except Exception as e:
+      logger.debug(f"Mouse zones buffer restore handled: {e}")
+
   def change_profile(self, index):
-    profile_name = self.get_active_profile_name()
-    if not profile_name:
-      return
+        profile_name = self.get_active_profile_name()
+        if not profile_name:
+            return
 
-    self.sync_all_profile_dropdowns(profile_name)
+        self.sync_all_profile_dropdowns(profile_name)
 
-    self.active_button_name = None
-    self.key_input.clear()
-    self.mouse_func_combo.setCurrentIndex(0)
-    self.update_button_visuals()
+        self.active_button_name = None
+        self.key_input.clear()
+        self.mouse_func_combo.blockSignals(True)
+        self.mouse_func_combo.setCurrentIndex(0)
+        self.mouse_func_combo.blockSignals(False)
+        self.update_button_visuals()
 
-    prof_data = self.profiles.get(profile_name, {})
-    if isinstance(prof_data, dict):
-      if "dpi" in prof_data:
-        target_dpi = prof_data["dpi"]
-        self.dpi_slider.blockSignals(True)
-        self.dpi_slider.setValue(target_dpi)
-        self.dpi_slider.blockSignals(False)
-        self.dpi_label.setText(
-            f"Current DPI: <b>{target_dpi}</b> (Profile Preset)"
-        )
-        self._apply_hw_dpi(target_dpi)
-      if (
-          "matrix" in prof_data
-          and hasattr(self, "active_paint_widget")
-          and self.current_target in prof_data["matrix"]
-      ):
-        self.active_paint_widget.load_frame(
-            prof_data["matrix"][self.current_target]
-        )
+        prof_data = self.profiles.get(profile_name, {})
+        if isinstance(prof_data, dict):
+            if "dpi" in prof_data:
+                target_dpi = prof_data["dpi"]
+                self.dpi_slider.blockSignals(True)
+                self.dpi_slider.setValue(target_dpi)
+                self.dpi_slider.blockSignals(False)
+                self.dpi_label.setText(f"Current DPI: <b>{target_dpi}</b> (Profile Preset)")
+                self._apply_hw_dpi(target_dpi)
 
-        self.apply_startup_lighting_buffers()
+            matrix_data = prof_data.get("matrix", {})
 
+            if "lighting_states" in prof_data:
+                loaded_states = prof_data["lighting_states"]
+                for target, state in loaded_states.items():
+                    for key, val in state.items():
+                        if key in ["color", "color2", "color3"] and isinstance(val, str):
+                            loaded_states[target][key] = QColor(val)
+                self.device_states = loaded_states
+                self.refresh_lighting_ui_from_state()
+            else:
+                if "keyboard" not in self.device_states:
+                    self.device_states["keyboard"] = {}
+                if "mouse" not in self.device_states:
+                    self.device_states["mouse"] = {}
+
+            # Handle Keyboard Matrix Buffer
+            raw_kb_buffer = matrix_data.get("keyboard", {})
+            kb_buffer = {}
+            if isinstance(raw_kb_buffer, dict):
+                for k, v in raw_kb_buffer.items():
+                    if isinstance(v, list) and len(v) == 3:
+                        kb_buffer[k] = v
+                    elif isinstance(v, str):
+                        try:
+                            col = QColor(v)
+                            kb_buffer[k] = [col.red(), col.green(), col.blue()]
+                        except Exception:
+                            pass
+                    else:
+                        kb_buffer[k] = v
+
+            if kb_buffer:
+                self.device_states["keyboard"]["effect"] = "Custom Lighting"
+                
+                if hasattr(self, "effect_combo"):
+                    self.effect_combo.blockSignals(True)
+                    self.effect_combo.setCurrentText("Custom Lighting")
+                    if hasattr(self, "current_target") and self.current_target == "keyboard":
+                        self.effect_combo.setEnabled(False)
+                    self.effect_combo.blockSignals(False)
+
+                if hasattr(self, "lighting_stack") and self.lighting_stack.currentIndex() != 1:
+                    self.lighting_stack.setCurrentIndex(1)
+                    if hasattr(self, "update_mode_button_styles"):
+                        self.update_mode_button_styles("matrix")
+
+                if hasattr(self, "restore_keyboard_matrix_buffer"):
+                    self.restore_keyboard_matrix_buffer(kb_buffer)
+
+                if hasattr(self, "active_paint_widget") and hasattr(self, "current_target") and self.current_target == "keyboard":
+                    if hasattr(self.active_paint_widget, "load_frame"):
+                        self.active_paint_widget.load_frame(kb_buffer)
+            else:
+                if self.device_states.get("keyboard", {}).get("effect") == "Custom Lighting":
+                    self.device_states["keyboard"]["effect"] = "Static (Custom Color)"
+                    
+                if hasattr(self, "effect_combo") and hasattr(self, "current_target") and self.current_target == "keyboard":
+                    self.effect_combo.setEnabled(True)
+                    current_effect = self.device_states["keyboard"].get("effect", "Static (Custom Color)")
+                    self.effect_combo.blockSignals(True)
+                    self.effect_combo.setCurrentText(current_effect)
+                    self.effect_combo.blockSignals(False)
+
+                if hasattr(self, "clear_keyboard_matrix_buffer"):
+                    try:
+                        self.clear_keyboard_matrix_buffer()
+                    except Exception:
+                        pass
+
+            # Handle Mouse Zones Buffer
+            mouse_buffer = matrix_data.get("mouse", [])
+            if isinstance(mouse_buffer, list) and mouse_buffer:
+                self.device_states["mouse"]["effect"] = "Custom Lighting"
+                
+                if hasattr(self, "effect_combo"):
+                    self.effect_combo.blockSignals(True)
+                    self.effect_combo.setCurrentText("Custom Lighting")
+                    if hasattr(self, "current_target") and self.current_target == "mouse":
+                        self.effect_combo.setEnabled(False)
+                    self.effect_combo.blockSignals(False)
+
+                if hasattr(self, "restore_mouse_zones_buffer"):
+                    self.restore_mouse_zones_buffer(mouse_buffer)
+                    
+                if hasattr(self, "active_paint_widget") and hasattr(self, "current_target") and self.current_target == "mouse":
+                    if hasattr(self.active_paint_widget, "load_frame"):
+                        self.active_paint_widget.load_frame(mouse_buffer)
+            else:
+                if hasattr(self, "effect_combo") and hasattr(self, "current_target") and self.current_target == "mouse":
+                    self.effect_combo.setEnabled(True)
+
+  def select_keyboard_target(self):
+        self.current_target = "keyboard"
+        profile_name = self.get_active_profile_name()
+        prof_data = self.profiles.get(profile_name, {})
+        has_kb_matrix = bool(prof_data.get("matrix", {}).get("keyboard"))
+        
+        if hasattr(self, "effect_combo"):
+            if has_kb_matrix:
+                self.effect_combo.blockSignals(True)
+                self.effect_combo.setCurrentText("Custom Lighting")
+                self.effect_combo.setEnabled(False)
+                self.effect_combo.blockSignals(False)
+            else:
+                self.effect_combo.setEnabled(True)
+                current_effect = self.device_states.get("keyboard", {}).get("effect", "Static (Custom Color)")
+                self.effect_combo.blockSignals(True)
+                self.effect_combo.setCurrentText(current_effect)
+                self.effect_combo.blockSignals(False)
+                
+        if hasattr(self, "refresh_lighting_ui_from_state"):
+            self.refresh_lighting_ui_from_state()
+
+  def select_mouse_target(self):
+        self.current_target = "mouse"
+        profile_name = self.get_active_profile_name()
+        prof_data = self.profiles.get(profile_name, {})
+        has_mouse_matrix = bool(prof_data.get("matrix", {}).get("mouse"))
+        
+        if hasattr(self, "effect_combo"):
+            if has_mouse_matrix:
+                self.effect_combo.blockSignals(True)
+                self.effect_combo.setCurrentText("Custom Lighting")
+                self.effect_combo.setEnabled(False)
+                self.effect_combo.blockSignals(False)
+            else:
+                self.effect_combo.setEnabled(True)
+                current_effect = self.device_states.get("mouse", {}).get("effect", "Static (Custom Color)")
+                self.effect_combo.blockSignals(True)
+                self.effect_combo.setCurrentText(current_effect)
+                self.effect_combo.blockSignals(False)
+
+        if hasattr(self, "refresh_lighting_ui_from_state"):
+            self.refresh_lighting_ui_from_state()
+            
   def create_profile(self):
     text, ok = QInputDialog.getText(self, "New Profile", "Enter name:")
     if ok and text.strip() and text.strip() not in self.profiles:
