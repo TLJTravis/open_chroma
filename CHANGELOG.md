@@ -10,8 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned
-- SHA-256 checksum verification during installation.
-- Clean process signal handling (`SIGINT`/`SIGTERM`).
+- SHA-256 checksum verification during installation[cite: 5].
+- Clean process signal handling (`SIGINT`/`SIGTERM`)[cite: 5].
+---
+
+## [1.1.0] - Universal X11 & Dual-Backend Linux Architecture - 2026-11-22
+
+### Added
+- **Universal X11 Window & Display Integration:** Refactored desktop environment interfacing to provide universal X11 compatibility across Linux distributions alongside graceful Wayland fallback support.
+- **Profile Rename Functionality:** Added a dedicated **Rename** button in the game profile management UI to easily rename existing lighting and macro profiles.
+
+### Changed
+- **Dual-Backend USB & Input Architecture:** Transitioned hardware communication to a unified Linux pipeline combining **OpenRazer**, **OpenRGB SDK**, custom `udev` rules, and `evdev`/`UInput` virtual device grabbing for lower-latency input remapping and lighting control.
+- **Linux Mint Wayland/X11 Architecture Preparation:** Aligned core display and window-tracking hooks with upcoming Linux Mint Wayland and X11 fallback updates.
 ---
 
 ## [1.0.9] - Launch Lighting & Window Alias Fixes - 2026-11-11

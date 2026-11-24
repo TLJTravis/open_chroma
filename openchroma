@@ -2,9 +2,11 @@
 
 # ==============================================================================
 # OPENCHROMA - UNIVERSAL PERIPHERAL CONTROL UTILITY FOR LINUX (UNIVERSAL)
+# Version: 1.1.0
 # Author: TLJTravis
-# Description: Per-profile key remapping, automated window switching, and Chroma lighting.
-# Supports Wayland & X11 across GNOME, Cinnamon, KDE, and XFCE via multi-backend detection.
+# Description: Per-profile key remapping (via kernel udev hwdb), automated window
+#              switching, and Chroma lighting. Supports Wayland & X11 across
+#              GNOME, Cinnamon, KDE, and XFCE via multi-backend detection.
 # ==============================================================================
 
 import glob
@@ -22,13 +24,10 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/usr/share/openchroma")
 
-from threading import Thread
-
-from PyQt6.QtCore import QPoint, QRectF, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
-    QFont,
     QIcon,
     QLinearGradient,
     QMouseEvent,
@@ -40,7 +39,6 @@ from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
-    QColorDialog,
     QComboBox,
     QDial,
     QDialog,
@@ -71,10 +69,14 @@ try:
 except ImportError:
   HAS_DBUS = False
 
-import evdev
-from evdev import UInput
-from evdev import ecodes as e
-from razer_backend import RazerBackend
+from razer_backend import (
+    DEFAULT_KEYPAD_RGB,
+    DEFAULT_LOGO_RGB,
+    DEFAULT_SCROLL_RGB,
+    RazerBackend,
+)
+
+__version__ = "1.1.0"
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -83,6 +85,7 @@ logger = logging.getLogger("OpenChroma-Universal")
 
 PROFILE_FILE = os.path.expanduser("~/.config/naga_profiles.json")
 RAZER_VENDOR_ID = 0x1532
+GAME_RGB_STOP_DELAY_SEC = 9.0
 
 IGNORED_BROWSERS = [
     "firefox",
@@ -298,7 +301,11 @@ class MouseZoneWidget(QWidget):
     self.current_color = QColor(0, 255, 0)
     self.selected_zone = 0
 
-    self.color_buffer = [[0, 255, 0], [0, 255, 0], [0, 255, 0]]
+    self.color_buffer = [
+        list(DEFAULT_SCROLL_RGB),
+        list(DEFAULT_LOGO_RGB),
+        list(DEFAULT_KEYPAD_RGB),
+    ]
     self.zone_names = ["Scroll Wheel", "Mouse Logo", "Side Keypad"]
 
     self.zone_locations = {
@@ -306,27 +313,6 @@ class MouseZoneWidget(QWidget):
         1: (50, 85, 34, 34),
         2: (25, 52, 16, 28),
     }
-
-    self.rgb_client = None
-    self.rgb_mouse = None
-    try:
-      from openrgb import OpenRGBClient
-
-      class SafeOpenRGBClient(OpenRGBClient):
-
-        def update(self):
-          try:
-            super().update()
-          except StopIteration:
-            pass
-
-      self.rgb_client = SafeOpenRGBClient("127.0.0.1", 6742)
-      self.rgb_client.get_devices()
-      devices = self.rgb_client.get_devices_by_name("Razer Naga Trinity")
-      if devices:
-        self.rgb_mouse = devices[0]
-    except Exception as e:
-      logger.debug(f"OpenRGB client initialization note: {e}")
 
     self.init_ui()
     self.select_zone(0)
@@ -488,6 +474,9 @@ class MouseZoneWidget(QWidget):
         f"background-color: {hex_str}; border: 1px solid #555555; border-radius:"
         " 4px;"
     )
+    self.color_buffer[self.selected_zone] = [col.red(), col.green(), col.blue()]
+    self.select_zone(self.selected_zone)
+    self.flush_frame()
 
   def apply_local_hex(self):
     text = self.local_hex.text().strip()
@@ -519,42 +508,25 @@ class MouseZoneWidget(QWidget):
 
   def load_frame(self, buffer):
     if isinstance(buffer, list) and len(buffer) == 3:
-      self.color_buffer = buffer
+      self.color_buffer = [list(z) for z in buffer]
     self.select_zone(self.selected_zone)
 
   def flush_frame(self):
     try:
-      if not self.rgb_client:
-        from openrgb import OpenRGBClient
-
-        class SafeOpenRGBClient(OpenRGBClient):
-
-          def update(self):
-            try:
-              super().update()
-            except StopIteration:
-              pass
-
-        self.rgb_client = SafeOpenRGBClient("127.0.0.1", 6742)
-
-      if self.rgb_client:
-        if not self.rgb_mouse:
-          for d in self.rgb_client.devices:
-            if "Naga" in d.name:
-              self.rgb_mouse = d
-              break
-
-        if self.rgb_mouse:
-          from openrgb.utils import RGBColor
-
-          for idx, rgb in enumerate(self.color_buffer):
-            if idx < len(self.rgb_mouse.zones):
-              color_obj = RGBColor(int(rgb[0]), int(rgb[1]), int(rgb[2]))
-              for led in self.rgb_mouse.zones[idx].leds:
-                led.set_color(color_obj)
-          self.rgb_mouse.show()
+      if len(self.color_buffer) == 3:
+        scroll_rgb = tuple(int(c) for c in self.color_buffer[0])
+        logo_rgb = tuple(int(c) for c in self.color_buffer[1])
+        keypad_rgb = tuple(int(c) for c in self.color_buffer[2])
+        if hasattr(self.razer, "paint_mouse_zones"):
+          ok = self.razer.paint_mouse_zones(scroll_rgb, logo_rgb, keypad_rgb)
+        elif hasattr(self.razer, "set_mouse_zones"):
+          ok = self.razer.set_mouse_zones(scroll_rgb, logo_rgb, keypad_rgb)
+        else:
+          ok = False
+        if not ok:
+          logger.warning("Mouse zone flush returned False")
     except Exception as e:
-      logger.debug(f"OpenRGB zone flush handled: {e}")
+      logger.debug(f"Mouse zone flush handled: {e}")
 
 
 class PaintableKeyButton(QPushButton):
@@ -1223,7 +1195,7 @@ class KeyboardEditorDialog(QDialog):
       import openrazer.client
       device_manager = openrazer.client.DeviceManager()
       for device in device_manager.devices:
-        if device.type == 'keyboard':
+        if device.type == "keyboard":
           matrix = [[(0, 0, 0) for _ in range(22)] for _ in range(6)]
 
           for key_name, rgb in self.color_buffer.items():
@@ -1378,11 +1350,9 @@ class RazerGenieKeyboardWidget(QWidget):
 
   def flush_frame(self):
     try:
-      try:
+      if hasattr(self.razer, "set_matrix_effect_custom"):
         self.razer.set_matrix_effect_custom("keyboard")
         time.sleep(0.02)
-      except Exception as e:
-        logger.error(f"Failed to set keyboard custom matrix effect: {e}")
 
       matrix = [[(0, 0, 0) for _ in range(22)] for _ in range(6)]
       coords = {
@@ -1505,8 +1475,19 @@ class RazerGenieKeyboardWidget(QWidget):
               if 0 <= r < 6 and 0 <= c < 22:
                 matrix[r][c] = color_tuple
 
-      matrix_tuples = [tuple(row) for row in matrix]
-      self.razer.set_matrix_custom_frame("keyboard", matrix_tuples)
+      if hasattr(self.razer, "set_matrix_custom_frame"):
+        matrix_tuples = [tuple(row) for row in matrix]
+        self.razer.set_matrix_custom_frame("keyboard", matrix_tuples)
+      else:
+        import openrazer.client
+        device_manager = openrazer.client.DeviceManager()
+        for device in device_manager.devices:
+          if device.type == "keyboard":
+            for r_idx, row in enumerate(matrix):
+              for c_idx, color in enumerate(row):
+                device.fx.advanced.matrix[r_idx, c_idx] = color
+            device.fx.advanced.draw()
+            break
     except Exception as e:
       logger.error(f"Keyboard matrix flush error: {e}")
 
@@ -1514,301 +1495,138 @@ class RazerGenieKeyboardWidget(QWidget):
     pass
 
 
-class LiveInputDaemon(Thread):
+class HwdbRemapper:
+  """Applies per-profile Razer Naga Trinity side-button mappings via kernel udev hwdb.
 
-  def __init__(self, get_current_profile_bindings_callback, app_reference, shutdown_event):
-    super().__init__()
-    self.daemon = True
-    self.get_bindings = get_current_profile_bindings_callback
-    self.app = app_reference
-    self.shutdown_event = shutdown_event
-    self.uinput = None
-    self.active_virtual_codes = set()
-    self.last_click_times = {}
-    self.DEBOUNCE_DELAY = 0.15
+  Eliminates exclusive evdev grabbing and /dev/uinput virtual devices so
+  remapping is 100% Wayland/X11 compatible and safe with anti-cheat software.
+  """
 
-  def init_uinput(self):
-    try:
-      capabilities = {
-          e.EV_KEY: [
-              e.KEY_A,
-              e.KEY_B,
-              e.KEY_C,
-              e.KEY_D,
-              e.KEY_E,
-              e.KEY_F,
-              e.KEY_G,
-              e.KEY_H,
-              e.KEY_I,
-              e.KEY_J,
-              e.KEY_K,
-              e.KEY_L,
-              e.KEY_M,
-              e.KEY_N,
-              e.KEY_O,
-              e.KEY_P,
-              e.KEY_Q,
-              e.KEY_R,
-              e.KEY_S,
-              e.KEY_T,
-              e.KEY_U,
-              e.KEY_V,
-              e.KEY_W,
-              e.KEY_X,
-              e.KEY_Y,
-              e.KEY_Z,
-              e.KEY_1,
-              e.KEY_2,
-              e.KEY_3,
-              e.KEY_4,
-              e.KEY_5,
-              e.KEY_6,
-              e.KEY_7,
-              e.KEY_8,
-              e.KEY_9,
-              e.KEY_0,
-              e.KEY_MINUS,
-              e.KEY_EQUAL,
-              e.KEY_LEFTCTRL,
-              e.KEY_LEFTSHIFT,
-              e.KEY_LEFTALT,
-              e.KEY_F1,
-              e.KEY_F2,
-              e.KEY_F3,
-              e.KEY_F4,
-              e.KEY_F5,
-              e.KEY_F6,
-              e.KEY_F7,
-              e.KEY_F8,
-              e.KEY_F9,
-              e.KEY_F10,
-              e.KEY_F11,
-              e.KEY_F12,
-              e.KEY_KPSLASH,
-              e.KEY_KPASTERISK,
-              e.KEY_KPMINUS,
-              e.KEY_KPPLUS,
-              e.KEY_KPENTER,
-              e.KEY_KP0,
-              e.KEY_KP1,
-              e.KEY_KP2,
-              e.KEY_KP3,
-              e.KEY_KP4,
-              e.KEY_KP5,
-              e.KEY_KP6,
-              e.KEY_KP7,
-              e.KEY_KP8,
-              e.KEY_KP9,
-              e.KEY_KPDOT,
-              e.BTN_LEFT,
-              e.BTN_RIGHT,
-              e.BTN_MIDDLE,
-              e.BTN_SIDE,
-              e.BTN_EXTRA,
-          ],
-          e.EV_REL: [e.REL_WHEEL, e.REL_HWHEEL],
-      }
-      self.uinput = UInput(capabilities, name="OpenChroma-Virtual-Input")
-      logger.info("Initialized evdev UInput virtual device.")
-    except Exception as err:
-      logger.error(f"Failed to create UInput device: {err}")
+  NAGA_SCANCODES = {
+      "1": "7001e",
+      "2": "7001f",
+      "3": "70020",
+      "4": "70021",
+      "5": "70022",
+      "6": "70023",
+      "7": "70024",
+      "8": "70025",
+      "9": "70026",
+      "10": "70027",
+      "11": "7002d",
+      "12": "7002e",
+  }
 
-  def find_mouse_keypad_devices(self):
-    devices = []
-    for path in evdev.list_devices():
+  KEY_TO_HWDB = {
+      "1": "1",
+      "2": "2",
+      "3": "3",
+      "4": "4",
+      "5": "5",
+      "6": "6",
+      "7": "7",
+      "8": "8",
+      "9": "9",
+      "0": "0",
+      "-": "minus",
+      "=": "equal",
+      "slash": "slash",
+      "/": "slash",
+      "kp_divide": "kpslash",
+      "kp_multiply": "kpasterisk",
+      "kp_minus": "kpminus",
+      "kp_plus": "kpplus",
+      "kp_enter": "kpenter",
+      "kp_0": "kp0",
+      "kp_1": "kp1",
+      "kp_2": "kp2",
+      "kp_3": "kp3",
+      "kp_4": "kp4",
+      "kp_5": "kp5",
+      "kp_6": "kp6",
+      "kp_7": "kp7",
+      "kp_8": "kp8",
+      "kp_9": "kp9",
+      "kp_decimal": "kpdot",
+      "left click": "btn_left",
+      "right click": "btn_right",
+      "middle click": "btn_middle",
+      "back": "btn_side",
+      "forward": "btn_extra",
+      "ctrl": "leftctrl",
+      "control": "leftctrl",
+      "shift": "leftshift",
+      "alt": "leftalt",
+      "space": "space",
+      "tab": "tab",
+      "enter": "enter",
+      "esc": "esc",
+      "escape": "esc",
+      "backspace": "backspace",
+  }
+
+  def __init__(self):
+    self.stage_path = f"/run/user/{os.getuid()}/openchroma-naga.hwdb"
+    self.helper_bin = "/usr/local/bin/openchroma-apply-hwdb"
+    self._last_written_content = None
+    self._lock = threading.Lock()
+
+  def _translate_action(self, action_str: str):
+    if not action_str or not str(action_str).strip():
+      return None
+    cleaned = str(action_str).strip().lower()
+    if "+" in cleaned:
+      cleaned = cleaned.split("+")[-1].strip()
+    if cleaned in self.KEY_TO_HWDB:
+      return self.KEY_TO_HWDB[cleaned]
+    if len(cleaned) == 1 and cleaned.isalpha():
+      return cleaned
+    if cleaned.startswith("f") and cleaned[1:].isdigit():
+      num = int(cleaned[1:])
+      if 1 <= num <= 24:
+        return f"f{num}"
+    return None
+
+  def build_hwdb_content(self, bindings: dict) -> str:
+    lines = ["evdev:input:b0003v1532p0067*"]
+    for btn_num, scancode in self.NAGA_SCANCODES.items():
+      target_action = bindings.get(btn_num, "")
+      hwdb_key = self._translate_action(target_action)
+      if hwdb_key:
+        lines.append(f" KEYBOARD_KEY_{scancode}={hwdb_key}")
+    return "\n".join(lines) + "\n"
+
+  def apply_bindings(self, bindings: dict):
+    content = self.build_hwdb_content(bindings or {})
+    if content == self._last_written_content:
+      return
+    threading.Thread(
+        target=self._write_and_trigger, args=(content,), daemon=True
+    ).start()
+
+  def _write_and_trigger(self, content: str):
+    with self._lock:
+      if content == self._last_written_content:
+        return
       try:
-        dev = evdev.InputDevice(path)
-        if "Naga" in dev.name and evdev.ecodes.EV_KEY in dev.capabilities():
-          caps = dev.capabilities()[evdev.ecodes.EV_KEY]
-          if evdev.ecodes.KEY_1 in caps or evdev.ecodes.KEY_KP1 in caps:
-            logger.info(f"Discovered Razer Naga input node at {path} ({dev.name})")
-            devices.append(dev)
+        os.makedirs(os.path.dirname(self.stage_path), exist_ok=True)
+        with open(self.stage_path, "w") as f:
+          f.write(content)
+        res = subprocess.run(
+            ["sudo", "-n", self.helper_bin],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode == 0:
+          self._last_written_content = content
+          logger.info("Applied Naga Trinity udev hwdb profile mapping.")
+        else:
+          logger.warning(
+              f"openchroma-apply-hwdb returned {res.returncode}: {res.stderr.strip()}"
+          )
       except Exception as err:
-        logger.debug(f"Error inspecting device {path}: {err}")
-    return devices
-
-  def send_combo_uinput(self, action_str, is_press):
-    if not self.uinput:
-      return
-
-    if "Click" in action_str:
-      click_map = {
-          "Left Click": e.BTN_LEFT,
-          "Right Click": e.BTN_RIGHT,
-          "Middle Click": e.BTN_MIDDLE,
-      }
-      if action_str in click_map:
-        val = 1 if is_press else 0
-        self.uinput.write(e.EV_KEY, click_map[action_str], val)
-        self.uinput.syn()
-      return
-
-    key_map = {
-        "ctrl": e.KEY_LEFTCTRL,
-        "control": e.KEY_LEFTCTRL,
-        "shift": e.KEY_LEFTSHIFT,
-        "alt": e.KEY_LEFTALT,
-        "1": e.KEY_1,
-        "2": e.KEY_2,
-        "3": e.KEY_3,
-        "4": e.KEY_4,
-        "5": e.KEY_5,
-        "6": e.KEY_6,
-        "7": e.KEY_7,
-        "8": e.KEY_8,
-        "9": e.KEY_9,
-        "0": e.KEY_0,
-        "-": e.KEY_MINUS,
-        "=": e.KEY_EQUAL,
-        "kp_divide": e.KEY_KPSLASH,
-        "kp_multiply": e.KEY_KPASTERISK,
-        "kp_minus": e.KEY_KPMINUS,
-        "kp_plus": e.KEY_KPPLUS,
-        "kp_enter": e.KEY_KPENTER,
-        "kp_0": e.KEY_KP0,
-        "kp_1": e.KEY_KP1,
-        "kp_2": e.KEY_KP2,
-        "kp_3": e.KEY_KP3,
-        "kp_4": e.KEY_KP4,
-        "kp_5": e.KEY_KP5,
-        "kp_6": e.KEY_KP6,
-        "kp_7": e.KEY_KP7,
-        "kp_8": e.KEY_KP8,
-        "kp_9": e.KEY_KP9,
-        "kp_decimal": e.KEY_KPDOT,
-        "a": e.KEY_A,
-        "b": e.KEY_B,
-        "c": e.KEY_C,
-        "d": e.KEY_D,
-        "e": e.KEY_E,
-        "f": e.KEY_F,
-        "g": e.KEY_G,
-        "h": e.KEY_H,
-        "i": e.KEY_I,
-        "j": e.KEY_J,
-        "k": e.KEY_K,
-        "l": e.KEY_L,
-        "m": e.KEY_M,
-        "n": e.KEY_N,
-        "o": e.KEY_O,
-        "p": e.KEY_P,
-        "q": e.KEY_Q,
-        "r": e.KEY_R,
-        "s": e.KEY_S,
-        "t": e.KEY_T,
-        "u": e.KEY_U,
-        "v": e.KEY_V,
-        "w": e.KEY_W,
-        "x": e.KEY_X,
-        "y": e.KEY_Y,
-        "z": e.KEY_Z,
-    }
-
-    parts = [p.lower().strip() for p in action_str.split("+")]
-    codes = [key_map[p] for p in parts if p in key_map]
-
-    if is_press:
-      for code in codes:
-        self.uinput.write(e.EV_KEY, code, 1)
-        self.active_virtual_codes.add(code)
-    else:
-      for code in reversed(codes):
-        self.uinput.write(e.EV_KEY, code, 0)
-        self.active_virtual_codes.discard(code)
-    self.uinput.syn()
-
-  def run(self):
-    from select import select
-
-    self.init_uinput()
-
-    mouse_devs = self.find_mouse_keypad_devices()
-    if not mouse_devs:
-      logger.error("LiveInputDaemon aborted: No Razer mouse keypad nodes found.")
-      return
-
-    grabbed_devs = []
-    for dev in mouse_devs:
-      try:
-        dev.grab()
-        grabbed_devs.append(dev)
-        logger.info(f"Successfully grabbed Naga node: {dev.name} at {dev.path}")
-      except Exception as err:
-        logger.error(f"Permission denied grabbing {dev.path}: {err}")
-
-    if not grabbed_devs:
-      logger.error("LiveInputDaemon aborted: Could not grab any Naga input nodes.")
-      return
-
-    dev_map = {dev.fileno(): dev for dev in grabbed_devs}
-
-    hardware_button_map = {
-        2: "1",
-        3: "2",
-        4: "3",
-        5: "4",
-        6: "5",
-        7: "6",
-        8: "7",
-        9: "8",
-        10: "9",
-        11: "10",
-        12: "11",
-        13: "12",
-    }
-    trinity_map = {
-        2: "1",
-        3: "2",
-        4: "3",
-        5: "4",
-        6: "5",
-        7: "6",
-        8: "7",
-        9: "8",
-        10: "9",
-        11: "10",
-        12: "11",
-        13: "12",
-        e.BTN_MIDDLE: "Top_M",
-        e.BTN_FORWARD: "Top_Forward",
-        e.BTN_BACK: "Top_Back",
-    }
-
-    try:
-      while not self.shutdown_event.is_set():
-        r, w, x = select(list(dev_map.keys()), [], [], 0.1)
-        for fd in r:
-          active_dev = dev_map[fd]
-          for event in active_dev.read():
-            if event.type != evdev.ecodes.EV_KEY:
-              continue
-
-            button_str = hardware_button_map.get(
-                event.code, trinity_map.get(event.code)
-            )
-            if button_str:
-              bindings = self.get_bindings()
-              target_action = bindings.get(button_str)
-
-              if event.value in (0, 1):
-                if event.value == 1:
-                  now = time.time()
-                  if now - self.last_click_times.get(event.code, 0) < self.DEBOUNCE_DELAY:
-                    continue
-                  self.last_click_times[event.code] = now
-
-                action_to_send = target_action if target_action else button_str
-                self.send_combo_uinput(action_to_send, event.value == 1)
-    except Exception as err:
-      logger.error(f"Exception in input loop: {err}")
-    finally:
-      for dev in grabbed_devs:
-        try:
-          dev.ungrab()
-        except Exception:
-          pass
-      if self.uinput:
-        self.uinput.close()
+        logger.error(f"Failed to apply hwdb bindings: {err}")
 
 
 def ensure_device_drivers():
@@ -1929,39 +1747,61 @@ class NagaSynapseApp(QWidget):
     return default_blueprints
 
   def apply_default_profile(self):
-      return self.apply_startup_lighting_buffers()
+    return self.apply_startup_lighting_buffers()
 
   def apply_startup_lighting_buffers(self, retry_count=0):
-      if not self.razer.devices.get("keyboard") and not self.razer.devices.get("mouse"):
-          if retry_count < 10:
-              logger.warning(f"Razer devices not ready (attempt {retry_count}/10), retrying...")
-              QTimer.singleShot(1000, lambda: self.apply_startup_lighting_buffers(retry_count + 1))
-              return
-          else:
-              logger.error("Timed out waiting for Razer devices on startup.")
-              return
-          
-      curr_prof = self.get_active_profile_name()
-      prof_data = self.profiles.get(curr_prof, {})
-      if not isinstance(prof_data, dict) or "matrix" not in prof_data:
-        return
+    curr_prof = self.get_active_profile_name()
+    prof_data = self.profiles.get(curr_prof, {})
+    matrix_dict = prof_data.get("matrix", {}) if isinstance(prof_data, dict) else {}
 
-      matrix_dict = prof_data["matrix"]
+    if "keyboard" in matrix_dict and matrix_dict["keyboard"]:
+      try:
+        self.restore_keyboard_matrix_buffer(matrix_dict["keyboard"])
+      except Exception as e:
+        logger.error(f"Startup keyboard lighting sync error: {e}")
 
-      if "keyboard" in matrix_dict and matrix_dict["keyboard"]:
-        try:
-          self.restore_keyboard_matrix_buffer(matrix_dict["keyboard"])
-        except Exception as e:
-          logger.error(f"Startup keyboard lighting sync error: {e}")
+    mouse_buffer = matrix_dict.get("mouse")
+    if isinstance(mouse_buffer, list) and len(mouse_buffer) == 3:
+      try:
+        self.restore_mouse_zones_buffer(mouse_buffer)
+        if hasattr(self, "active_paint_widget") and isinstance(self.active_paint_widget, MouseZoneWidget):
+          self.active_paint_widget.load_frame(mouse_buffer)
+      except Exception as e:
+        logger.error(f"Startup mouse lighting sync error: {e}")
+    elif hasattr(self.razer, "paint_mouse_zones"):
+      self.razer.paint_mouse_zones()
 
-      if "mouse" in matrix_dict and matrix_dict["mouse"]:
-        try:
-          mouse_buffer = matrix_dict["mouse"]
-          self.restore_mouse_zones_buffer(mouse_buffer)
-          if hasattr(self, "active_paint_widget") and hasattr(self.active_paint_widget, "load_frame"):
-            self.active_paint_widget.load_frame(mouse_buffer)
-        except Exception as e:
-          logger.error(f"Startup mouse lighting sync error: {e}")
+  def _is_game_window_active(self, profile_name: str, window_title: str, class_tokens: list) -> bool:
+    if should_ignore_window(window_title, " ".join(class_tokens)):
+      return False
+    if profile_name and profile_name != "Default Profile":
+      return True
+    return any(str(tok).startswith("steam_app_") for tok in (class_tokens or []))
+
+  def _sync_universal_game_rgb(self, is_game_window_active: bool) -> None:
+    if not is_game_window_active:
+      self._game_window_open_since = None
+      self._stopped_for_current_session = False
+      return
+
+    if getattr(self, "_stopped_for_current_session", False):
+      return
+
+    now = time.monotonic()
+    open_since = getattr(self, "_game_window_open_since", None)
+    if open_since is None:
+      self._game_window_open_since = now
+      return
+
+    if (now - open_since) >= GAME_RGB_STOP_DELAY_SEC:
+      logger.info(
+          "Game window open for %.1fs; stopping OpenRGB backend.",
+          now - open_since,
+      )
+      if hasattr(self.razer, "stop_rgb_server"):
+        self.razer.stop_rgb_server()
+      self._stopped_for_current_session = True
+      self._game_window_open_since = None
 
   def __init__(self):
     super().__init__()
@@ -1976,6 +1816,8 @@ class NagaSynapseApp(QWidget):
     self.saved_geometry = None
     self.session_type = os.environ.get("XDG_SESSION_TYPE", "x11").lower()
     self.last_seen_window = None
+    self._game_window_open_since = None
+    self._stopped_for_current_session = False
 
     self.shutdown_event = threading.Event()
     self.profiles = self.load_profiles()
@@ -2016,7 +1858,7 @@ class NagaSynapseApp(QWidget):
     self.dpi_stages = [300, 800, 1800, 3200, 4800, 6400, 7600, 9200, 12000]
     self.current_dpi_index = 2
     self.osd = DpiOsdOverlay()
-    
+
     self.profile_dropdowns = []
     self.initUI()
     self.update_detected_hardware_labels()
@@ -2031,10 +1873,7 @@ class NagaSynapseApp(QWidget):
     self.profile_timer.timeout.connect(self.poll_active_window)
     self.profile_timer.start(1500)
 
-    self.input_daemon = LiveInputDaemon(
-        self.get_active_bindings, self, self.shutdown_event
-    )
-    self.input_daemon.start()
+    self.hwdb_remapper = HwdbRemapper()
 
     if self.is_mmo_mouse:
       self.set_panel_view("12-button")
@@ -2042,7 +1881,7 @@ class NagaSynapseApp(QWidget):
       self.set_panel_view("2-button")
 
     self.change_profile(0)
-    QTimer.singleShot(2500, self.apply_startup_lighting_buffers)
+    QTimer.singleShot(800, self.apply_startup_lighting_buffers)
 
   def get_active_window_info(self):
     wm_class = ""
@@ -2105,12 +1944,18 @@ class NagaSynapseApp(QWidget):
   def poll_active_window(self):
     win_id, class_tokens, window_title = self.get_active_window_info()
     if not win_id and not class_tokens:
+      self._sync_universal_game_rgb(False)
       return
 
     combined_key = (win_id, tuple(class_tokens), window_title)
     if self.last_seen_window != combined_key:
       self.last_seen_window = combined_key
       self.handle_auto_window_switch((win_id, class_tokens, window_title))
+    else:
+      active_prof = self.get_active_profile_name()
+      self._sync_universal_game_rgb(
+          self._is_game_window_active(active_prof, window_title, class_tokens)
+      )
 
   def get_process_cmdline(self, win_id):
     try:
@@ -2128,6 +1973,7 @@ class NagaSynapseApp(QWidget):
     matched_token = None
 
     if should_ignore_window(window_title):
+      self._sync_universal_game_rgb(False)
       return
 
     clean_title = window_title.strip().lower()
@@ -2194,6 +2040,12 @@ class NagaSynapseApp(QWidget):
         if matched_profile != "Default Profile" and not proc_cmdline:
           self.register_active_alias(matched_profile, clean_title)
 
+      self._sync_universal_game_rgb(
+          self._is_game_window_active(matched_profile, clean_title, class_tokens)
+      )
+    else:
+      self._sync_universal_game_rgb(False)
+
   def showEvent(self, event):
     super().showEvent(event)
     icon_path = get_asset_path("OpenChroma.png")
@@ -2208,7 +2060,8 @@ class NagaSynapseApp(QWidget):
   def closeEvent(self, event):
     logger.info("Initiating clean shutdown for OpenChroma...")
     self.shutdown_event.set()
-    self.input_daemon.join(timeout=1.0)
+    if hasattr(self.razer, "stop_rgb_server"):
+      self.razer.stop_rgb_server()
     event.accept()
 
   def detect_mmo_mouse(self):
@@ -2251,7 +2104,7 @@ class NagaSynapseApp(QWidget):
     self.set_exact_dpi_preset(closest_dpi, trigger_osd=False)
 
   def initUI(self):
-    self.setWindowTitle("OpenChroma Controls (Universal - 1.0.8)")
+    self.setWindowTitle(f"OpenChroma Controls (Universal - {__version__})")
 
     icon_path = get_asset_path("OpenChroma.png")
     if os.path.exists(icon_path):
@@ -2341,6 +2194,10 @@ class NagaSynapseApp(QWidget):
     new_prof_btn = QPushButton("+ New")
     new_prof_btn.clicked.connect(self.create_profile)
     mgmt_bar.addWidget(new_prof_btn)
+
+    rename_prof_btn = QPushButton("Rename")
+    rename_prof_btn.clicked.connect(self.rename_profile)
+    mgmt_bar.addWidget(rename_prof_btn)
 
     delete_prof_btn = QPushButton("Delete")
     delete_prof_btn.setStyleSheet(
@@ -2517,6 +2374,50 @@ class NagaSynapseApp(QWidget):
     self.tray_icon.activated.connect(self.handle_tray_activation)
     self.tray_icon.show()
 
+  def rename_profile(self):
+    current_prof = self.get_active_profile_name()
+    if not current_prof or current_prof == "Default Profile":
+      QMessageBox.warning(
+          self,
+          "Warning",
+          "Cannot rename the Default Profile or an empty selection.",
+      )
+      return
+
+    text, ok = QInputDialog.getText(
+        self, "Rename Profile", "Enter new profile name:", text=current_prof
+    )
+    if ok and text.strip():
+      new_name = text.strip()
+      if new_name == current_prof:
+        return
+      if new_name in self.profiles:
+        QMessageBox.warning(
+            self,
+            "Error",
+            f"A profile named '{new_name}' already exists.",
+        )
+        return
+
+      self.profiles[new_name] = self.profiles.pop(current_prof)
+      self.remove_profile_file(current_prof)
+
+      for combo in self.profile_dropdowns:
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(self.get_profile_names())
+        combo.setCurrentText(new_name)
+        combo.blockSignals(False)
+
+      self.update_tray_profile_menu()
+      self.save_to_disk()
+
+      QMessageBox.information(
+          self,
+          "Success",
+          f"Profile successfully renamed to '{new_name}'.",
+      )
+
   def update_tray_profile_menu(self):
     if not hasattr(self, "tray_profile_menu"):
       return
@@ -2530,6 +2431,7 @@ class NagaSynapseApp(QWidget):
 
   def select_profile_from_tray(self, profile_name):
     self.sync_all_profile_dropdowns(profile_name)
+    self.change_profile(0)
 
   def handle_tray_activation(self, reason):
     if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -3068,14 +2970,12 @@ X-GNOME-Autostart-enabled=true
     else:
       self.lighting_stack.setCurrentIndex(1)
       self.update_mode_button_styles("matrix")
-      try:
-        self.razer.set_matrix_effect_custom(self.current_target)
-        time.sleep(0.02)
-      except Exception as e:
-        logger.error(
-            "Failed to switch to custom matrix mode for"
-            f" {self.current_target}: {e}"
-        )
+      if self.current_target == "keyboard" and hasattr(self.razer, "set_matrix_effect_custom"):
+        try:
+          self.razer.set_matrix_effect_custom("keyboard")
+          time.sleep(0.02)
+        except Exception as e:
+          logger.error(f"Failed to switch keyboard to custom matrix mode: {e}")
       if hasattr(self, "active_paint_widget") and self.active_paint_widget:
         self.active_paint_widget.flush_frame()
 
@@ -3290,11 +3190,25 @@ X-GNOME-Autostart-enabled=true
 
     if active_slot == 1:
       st["color"] = col
-      self.apply_static_color_to_device(
-          self.current_target, col.red(), col.green(), col.blue()
-      )
-      if hasattr(self, "active_paint_widget"):
-        self.active_paint_widget.set_brush_color(col)
+      if (
+          self.current_target == "mouse"
+          and hasattr(self, "active_paint_widget")
+          and isinstance(self.active_paint_widget, MouseZoneWidget)
+      ):
+        z_idx = self.active_paint_widget.selected_zone
+        self.active_paint_widget.current_color = col
+        self.active_paint_widget.color_buffer[z_idx] = [
+            col.red(),
+            col.green(),
+            col.blue(),
+        ]
+        self.active_paint_widget.on_local_color_picked(col)
+      else:
+        self.apply_static_color_to_device(
+            self.current_target, col.red(), col.green(), col.blue()
+        )
+        if hasattr(self, "active_paint_widget"):
+          self.active_paint_widget.set_brush_color(col)
     elif active_slot == 2:
       st["color2"] = col
     else:
@@ -3319,11 +3233,25 @@ X-GNOME-Autostart-enabled=true
 
       if active_slot == 1:
         st["color"] = col
-        self.apply_static_color_to_device(
-            self.current_target, col.red(), col.green(), col.blue()
-        )
-        if hasattr(self, "active_paint_widget"):
-          self.active_paint_widget.set_brush_color(col)
+        if (
+            self.current_target == "mouse"
+            and hasattr(self, "active_paint_widget")
+            and isinstance(self.active_paint_widget, MouseZoneWidget)
+        ):
+          z_idx = self.active_paint_widget.selected_zone
+          self.active_paint_widget.current_color = col
+          self.active_paint_widget.color_buffer[z_idx] = [
+              col.red(),
+              col.green(),
+              col.blue(),
+          ]
+          self.active_paint_widget.on_local_color_picked(col)
+        else:
+          self.apply_static_color_to_device(
+              self.current_target, col.red(), col.green(), col.blue()
+          )
+          if hasattr(self, "active_paint_widget"):
+            self.active_paint_widget.set_brush_color(col)
       elif active_slot == 2:
         st["color2"] = col
       else:
@@ -3351,7 +3279,7 @@ X-GNOME-Autostart-enabled=true
     is_animated = effect_name in ["Breathe", "Two-Color Breathe", "Spectrum Cycling", "Wave"]
 
     if effect_name == "Custom Lighting" or is_animated:
-      if self.current_target == "keyboard":
+      if self.current_target == "keyboard" and hasattr(self.razer, "set_matrix_effect_custom"):
         try:
           self.razer.set_matrix_effect_custom("keyboard")
           time.sleep(0.02)
@@ -3412,6 +3340,20 @@ X-GNOME-Autostart-enabled=true
     st = self.device_states[self.current_target]
     st["breathe_speed"] = value
 
+  def _push_keyboard_matrix(self, matrix_tuples):
+    if hasattr(self.razer, "set_matrix_custom_frame"):
+      self.razer.set_matrix_custom_frame("keyboard", matrix_tuples)
+      return
+    import openrazer.client
+    device_manager = openrazer.client.DeviceManager()
+    for device in device_manager.devices:
+      if device.type == "keyboard":
+        for r_idx, row in enumerate(matrix_tuples):
+          for c_idx, color in enumerate(row):
+            device.fx.advanced.matrix[r_idx, c_idx] = color
+        device.fx.advanced.draw()
+        break
+
   def run_independent_breathe_steps(self):
     st = self.device_states["keyboard"]
     effect_name = st["effect"]
@@ -3442,7 +3384,7 @@ X-GNOME-Autostart-enabled=true
 
         matrix = [[color_tuple for _ in range(22)] for _ in range(6)]
         matrix_tuples = [tuple(row) for row in matrix]
-        self.razer.set_matrix_custom_frame("keyboard", matrix_tuples)
+        self._push_keyboard_matrix(matrix_tuples)
         return
 
       if effect_name == "Wave":
@@ -3499,7 +3441,7 @@ X-GNOME-Autostart-enabled=true
             )
 
         matrix_tuples = [tuple(row) for row in matrix]
-        self.razer.set_matrix_custom_frame("keyboard", matrix_tuples)
+        self._push_keyboard_matrix(matrix_tuples)
         return
 
       min_val = st["breathe_min"]
@@ -3670,74 +3612,79 @@ X-GNOME-Autostart-enabled=true
                   matrix[r][c] = scaled_rgb
 
       matrix_tuples = [tuple(row) for row in matrix]
-      self.razer.set_matrix_custom_frame("keyboard", matrix_tuples)
+      self._push_keyboard_matrix(matrix_tuples)
     except Exception as e:
       logger.error(f"Animation frame error: {e}")
 
   def restore_keyboard_matrix_buffer(self, kb_buffer):
-        try:
-            # Set the custom mode using the wrapper just in case
-            if hasattr(self, "razer") and hasattr(self.razer, "set_matrix_effect_custom"):
-                self.razer.set_matrix_effect_custom("keyboard")
-            import time
-            time.sleep(0.02)
-            
-            coords = {
-                "Esc": (0, 0, 0), "F1": (0, 2, 2), "F2": (0, 3, 3), "F3": (0, 4, 4),
-                "F4": (0, 5, 5), "F5": (0, 6, 6), "F6": (0, 7, 7), "F7": (0, 8, 8),
-                "F8": (0, 9, 9), "F9": (0, 10, 10), "F10": (0, 11, 11), "F11": (0, 12, 12),
-                "F12": (0, 13, 13), "PrtSc": (0, 15, 15), "ScrollLock": (0, 16, 16), "Pause": (0, 17, 17),
-                "`": (1, 0, 0), "1": (1, 1, 1), "2": (1, 2, 2), "3": (1, 3, 3), "4": (1, 4, 4),
-                "5": (1, 5, 5), "6": (1, 6, 6), "7": (1, 7, 7), "8": (1, 8, 8), "9": (1, 9, 9),
-                "0": (1, 10, 10), "-": (1, 11, 11), "=": (1, 12, 12), "Backspace": (1, 13, 14),
-                "Ins": (1, 15, 15), "Home": (1, 16, 16), "PgUp": (1, 17, 17), "NumLock": (1, 18, 18),
-                "Num_/": (1, 19, 19), "Num_*": (1, 20, 20), "Num_-": (1, 21, 21),
-                "Tab": (2, 0, 1), "Q": (2, 2, 2), "W": (2, 3, 3), "E": (2, 4, 4), "R": (2, 5, 5),
-                "T": (2, 6, 6), "Y": (2, 7, 7), "U": (2, 8, 8), "I": (2, 9, 9), "O": (2, 10, 10),
-                "P": (2, 11, 11), "[": (2, 12, 12), "]": (2, 13, 13), "\\": (2, 14, 15),
-                "Del": (2, 15, 15), "End": (2, 16, 16), "PgDn": (2, 17, 17),
-                "Num_7": (2, 18, 18), "Num_8": (2, 19, 19), "Num_9": (2, 20, 20), "Num_+": (2, 21, 21, 3, 21),
-                "Caps": (3, 0, 1), "A": (3, 2, 2), "S": (3, 3, 3), "D": (3, 4, 4), "F": (3, 5, 5),
-                "G": (3, 6, 6), "H": (3, 7, 7), "J": (3, 8, 8), "K": (3, 9, 9), "L": (3, 10, 10),
-                ";": (3, 11, 11), "'": (3, 12, 12), "Enter": (3, 13, 14),
-                "Num_4": (3, 18, 18), "Num_5": (3, 19, 19), "Num_6": (3, 20, 20),
-                "Shift": (4, 0, 2), "Z": (4, 3, 3), "X": (4, 4, 4), "C": (4, 5, 5), "V": (4, 6, 6),
-                "B": (4, 7, 7), "N": (4, 8, 8), "M": (4, 9, 9), ",": (4, 10, 10), ".": (4, 11, 11),
-                "/": (4, 12, 12), "RShift": (4, 13, 15), "↑": (4, 16, 16),
-                "Num_1": (4, 18, 18), "Num_2": (4, 19, 19), "Num_3": (4, 20, 20), "Num_Enter": (4, 21, 21, 5, 21),
-                "Ctrl": (5, 0, 0), "Win": (5, 1, 1), "Alt": (5, 2, 2), "Space": (5, 5, 9),
-                "RAlt": (5, 11, 11), "Fn": (5, 12, 12), "Menu": (5, 13, 13), "RCtrl": (5, 14, 14),
-                "←": (5, 15, 15), "↓": (5, 16, 16), "→": (5, 17, 17),
-                "Num_0": (5, 18, 19), "Num_.": (5, 20, 20)
-            }
-            
-            # The exact direct connection that you just proved works!
-            import openrazer.client
-            device_manager = openrazer.client.DeviceManager()
-            for device in device_manager.devices:
-                if device.type == 'keyboard':
-                    for key_name, rgb in kb_buffer.items():
-                        if key_name in coords:
-                            info = coords[key_name]
-                            r_idx, c_start, c_end = info[0], info[1], info[2]
-                            r_end = info[3] if len(info) > 3 else r_idx
-                            color_tuple = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
-                            
-                            for r in range(r_idx, r_end + 1):
-                                for c in range(c_start, c_end + 1):
-                                    if 0 <= r < 6 and 0 <= c < 22:
-                                        device.fx.advanced.matrix[r, c] = color_tuple
-                                        
-                    # The vital draw command that pushes it to the Ornata V2
-                    device.fx.advanced.draw()
-                    break 
+    try:
+      if hasattr(self, "razer") and hasattr(self.razer, "set_matrix_effect_custom"):
+        self.razer.set_matrix_effect_custom("keyboard")
+      time.sleep(0.02)
 
-        except Exception as e:
-            print(f"Bypass failed: {e}")
+      coords = {
+          "Esc": (0, 0, 0), "F1": (0, 2, 2), "F2": (0, 3, 3), "F3": (0, 4, 4),
+          "F4": (0, 5, 5), "F5": (0, 6, 6), "F6": (0, 7, 7), "F7": (0, 8, 8),
+          "F8": (0, 9, 9), "F9": (0, 10, 10), "F10": (0, 11, 11), "F11": (0, 12, 12),
+          "F12": (0, 13, 13), "PrtSc": (0, 15, 15), "ScrollLock": (0, 16, 16), "Pause": (0, 17, 17),
+          "`": (1, 0, 0), "1": (1, 1, 1), "2": (1, 2, 2), "3": (1, 3, 3), "4": (1, 4, 4),
+          "5": (1, 5, 5), "6": (1, 6, 6), "7": (1, 7, 7), "8": (1, 8, 8), "9": (1, 9, 9),
+          "0": (1, 10, 10), "-": (1, 11, 11), "=": (1, 12, 12), "Backspace": (1, 13, 14),
+          "Ins": (1, 15, 15), "Home": (1, 16, 16), "PgUp": (1, 17, 17), "NumLock": (1, 18, 18),
+          "Num_/": (1, 19, 19), "Num_*": (1, 20, 20), "Num_-": (1, 21, 21),
+          "Tab": (2, 0, 1), "Q": (2, 2, 2), "W": (2, 3, 3), "E": (2, 4, 4), "R": (2, 5, 5),
+          "T": (2, 6, 6), "Y": (2, 7, 7), "U": (2, 8, 8), "I": (2, 9, 9), "O": (2, 10, 10),
+          "P": (2, 11, 11), "[": (2, 12, 12), "]": (2, 13, 13), "\\": (2, 14, 15),
+          "Del": (2, 15, 15), "End": (2, 16, 16), "PgDn": (2, 17, 17),
+          "Num_7": (2, 18, 18), "Num_8": (2, 19, 19), "Num_9": (2, 20, 20), "Num_+": (2, 21, 21, 3, 21),
+          "Caps": (3, 0, 1), "A": (3, 2, 2), "S": (3, 3, 3), "D": (3, 4, 4), "F": (3, 5, 5),
+          "G": (3, 6, 6), "H": (3, 7, 7), "J": (3, 8, 8), "K": (3, 9, 9), "L": (3, 10, 10),
+          ";": (3, 11, 11), "'": (3, 12, 12), "Enter": (3, 13, 14),
+          "Num_4": (3, 18, 18), "Num_5": (3, 19, 19), "Num_6": (3, 20, 20),
+          "Shift": (4, 0, 2), "Z": (4, 3, 3), "X": (4, 4, 4), "C": (4, 5, 5), "V": (4, 6, 6),
+          "B": (4, 7, 7), "N": (4, 8, 8), "M": (4, 9, 9), ",": (4, 10, 10), ".": (4, 11, 11),
+          "/": (4, 12, 12), "RShift": (4, 13, 15), "↑": (4, 16, 16),
+          "Num_1": (4, 18, 18), "Num_2": (4, 19, 19), "Num_3": (4, 20, 20), "Num_Enter": (4, 21, 21, 5, 21),
+          "Ctrl": (5, 0, 0), "Win": (5, 1, 1), "Alt": (5, 2, 2), "Space": (5, 5, 9),
+          "RAlt": (5, 11, 11), "Fn": (5, 12, 12), "Menu": (5, 13, 13), "RCtrl": (5, 14, 14),
+          "←": (5, 15, 15), "↓": (5, 16, 16), "→": (5, 17, 17),
+          "Num_0": (5, 18, 19), "Num_.": (5, 20, 20)
+      }
+
+      import openrazer.client
+      device_manager = openrazer.client.DeviceManager()
+      for device in device_manager.devices:
+        if device.type == "keyboard":
+          for key_name, rgb in kb_buffer.items():
+            if key_name in coords:
+              info = coords[key_name]
+              r_idx, c_start, c_end = info[0], info[1], info[2]
+              r_end = info[3] if len(info) > 3 else r_idx
+              color_tuple = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+              for r in range(r_idx, r_end + 1):
+                for c in range(c_start, c_end + 1):
+                  if 0 <= r < 6 and 0 <= c < 22:
+                    device.fx.advanced.matrix[r, c] = color_tuple
+
+          device.fx.advanced.draw()
+          break
+
+    except Exception as e:
+      logger.error(f"Keyboard matrix restore failed: {e}")
 
   def on_brightness_changed(self, value):
     self.bright_label.setText(f"Brightness: <b>{value}%</b>")
     self.device_states[self.current_target]["brightness"] = value
+    if self.current_target == "mouse":
+      self.razer._level["mouse"] = max(0, min(100, int(value)))
+      if getattr(self.razer, "_mouse_zones", None) is not None:
+        self.razer.set_mouse_zones(*self.razer._mouse_zones)
+      elif hasattr(self, "active_paint_widget") and isinstance(self.active_paint_widget, MouseZoneWidget):
+        self.active_paint_widget.flush_frame()
+      else:
+        self.razer.paint_mouse_zones()
+      return
     self.razer.set_brightness(self.current_target, value)
 
   def handle_mouse_function_selection(self, index):
@@ -3812,6 +3759,10 @@ X-GNOME-Autostart-enabled=true
 
     if target == "mouse":
       self.active_paint_widget = MouseZoneWidget(self.razer)
+      curr_prof = self.get_active_profile_name()
+      mouse_buf = self.profiles.get(curr_prof, {}).get("matrix", {}).get("mouse")
+      if isinstance(mouse_buf, list) and len(mouse_buf) == 3:
+        self.active_paint_widget.load_frame(mouse_buf)
     else:
       self.active_paint_widget = RazerGenieKeyboardWidget(self.razer, self)
 
@@ -4282,192 +4233,200 @@ X-GNOME-Autostart-enabled=true
       json.dump(self.profiles, f, indent=4)
     self.update_button_visuals()
     self.update_tray_profile_menu()
+    self.hwdb_remapper.apply_bindings(self.get_active_bindings())
+    if self.current_target == "mouse" and hasattr(self, "active_paint_widget") and isinstance(self.active_paint_widget, MouseZoneWidget):
+      self.active_paint_widget.flush_frame()
     QMessageBox.information(
         self, "Success", "Layout profiles and DPI settings successfully updated."
     )
 
   def restore_mouse_zones_buffer(self, mouse_buffer):
     try:
+      if not (isinstance(mouse_buffer, list) and len(mouse_buffer) == 3):
+        return
+
       if hasattr(self, "active_paint_widget") and isinstance(self.active_paint_widget, MouseZoneWidget):
         self.active_paint_widget.load_frame(mouse_buffer)
         self.active_paint_widget.flush_frame()
         return
 
-      from openrgb import OpenRGBClient
-      from openrgb.utils import RGBColor
-      client = OpenRGBClient("127.0.0.1", 6742, timeout=2)
-      devices = client.get_devices_by_name("Razer Naga Trinity")
-      if devices:
-        rgb_mouse = devices[0]
-        for idx, rgb in enumerate(mouse_buffer):
-          if idx < len(rgb_mouse.zones):
-            color_obj = RGBColor(int(rgb[0]), int(rgb[1]), int(rgb[2]))
-            for led in rgb_mouse.zones[idx].leds:
-              led.set_color(color_obj)
-        rgb_mouse.show()
+      scroll_rgb = tuple(int(c) for c in mouse_buffer[0])
+      logo_rgb = tuple(int(c) for c in mouse_buffer[1])
+      keypad_rgb = tuple(int(c) for c in mouse_buffer[2])
+      if hasattr(self.razer, "paint_mouse_zones"):
+        self.razer.paint_mouse_zones(scroll_rgb, logo_rgb, keypad_rgb)
+      elif hasattr(self.razer, "set_mouse_zones"):
+        self.razer.set_mouse_zones(scroll_rgb, logo_rgb, keypad_rgb)
     except Exception as e:
       logger.debug(f"Mouse zones buffer restore handled: {e}")
 
   def change_profile(self, index):
-        profile_name = self.get_active_profile_name()
-        if not profile_name:
-            return
+    profile_name = self.get_active_profile_name()
+    if not profile_name:
+      return
 
-        self.sync_all_profile_dropdowns(profile_name)
+    self.sync_all_profile_dropdowns(profile_name)
 
-        self.active_button_name = None
-        self.key_input.clear()
-        self.mouse_func_combo.blockSignals(True)
-        self.mouse_func_combo.setCurrentIndex(0)
-        self.mouse_func_combo.blockSignals(False)
-        self.update_button_visuals()
+    self.active_button_name = None
+    self.key_input.clear()
+    self.mouse_func_combo.blockSignals(True)
+    self.mouse_func_combo.setCurrentIndex(0)
+    self.mouse_func_combo.blockSignals(False)
+    self.update_button_visuals()
+    self.hwdb_remapper.apply_bindings(self.get_active_bindings())
 
-        prof_data = self.profiles.get(profile_name, {})
-        if isinstance(prof_data, dict):
-            if "dpi" in prof_data:
-                target_dpi = prof_data["dpi"]
-                self.dpi_slider.blockSignals(True)
-                self.dpi_slider.setValue(target_dpi)
-                self.dpi_slider.blockSignals(False)
-                self.dpi_label.setText(f"Current DPI: <b>{target_dpi}</b> (Profile Preset)")
-                self._apply_hw_dpi(target_dpi)
+    prof_data = self.profiles.get(profile_name, {})
+    if isinstance(prof_data, dict):
+      if "dpi" in prof_data:
+        target_dpi = prof_data["dpi"]
+        self.dpi_slider.blockSignals(True)
+        self.dpi_slider.setValue(target_dpi)
+        self.dpi_slider.blockSignals(False)
+        self.dpi_label.setText(f"Current DPI: <b>{target_dpi}</b> (Profile Preset)")
+        self._apply_hw_dpi(target_dpi)
 
-            matrix_data = prof_data.get("matrix", {})
+      matrix_data = prof_data.get("matrix", {})
 
-            if "lighting_states" in prof_data:
-                loaded_states = prof_data["lighting_states"]
-                for target, state in loaded_states.items():
-                    for key, val in state.items():
-                        if key in ["color", "color2", "color3"] and isinstance(val, str):
-                            loaded_states[target][key] = QColor(val)
-                self.device_states = loaded_states
-                self.refresh_lighting_ui_from_state()
-            else:
-                if "keyboard" not in self.device_states:
-                    self.device_states["keyboard"] = {}
-                if "mouse" not in self.device_states:
-                    self.device_states["mouse"] = {}
+      if "lighting_states" in prof_data:
+        loaded_states = prof_data["lighting_states"]
+        for target, state in loaded_states.items():
+          for key, val in state.items():
+            if key in ["color", "color2", "color3"] and isinstance(val, str):
+              loaded_states[target][key] = QColor(val)
+        self.device_states = loaded_states
+        self.refresh_lighting_ui_from_state()
+      else:
+        if "keyboard" not in self.device_states:
+          self.device_states["keyboard"] = {}
+        if "mouse" not in self.device_states:
+          self.device_states["mouse"] = {}
 
-            # Handle Keyboard Matrix Buffer
-            raw_kb_buffer = matrix_data.get("keyboard", {})
-            kb_buffer = {}
-            if isinstance(raw_kb_buffer, dict):
-                for k, v in raw_kb_buffer.items():
-                    if isinstance(v, list) and len(v) == 3:
-                        kb_buffer[k] = v
-                    elif isinstance(v, str):
-                        try:
-                            col = QColor(v)
-                            kb_buffer[k] = [col.red(), col.green(), col.blue()]
-                        except Exception:
-                            pass
-                    else:
-                        kb_buffer[k] = v
+      raw_kb_buffer = matrix_data.get("keyboard", {})
+      kb_buffer = {}
+      if isinstance(raw_kb_buffer, dict):
+        for k, v in raw_kb_buffer.items():
+          if isinstance(v, list) and len(v) == 3:
+            kb_buffer[k] = v
+          elif isinstance(v, str):
+            try:
+              col = QColor(v)
+              kb_buffer[k] = [col.red(), col.green(), col.blue()]
+            except Exception:
+              pass
+          else:
+            kb_buffer[k] = v
 
-            if kb_buffer:
-                self.device_states["keyboard"]["effect"] = "Custom Lighting"
-                
-                if hasattr(self, "effect_combo"):
-                    self.effect_combo.blockSignals(True)
-                    self.effect_combo.setCurrentText("Custom Lighting")
-                    if hasattr(self, "current_target") and self.current_target == "keyboard":
-                        self.effect_combo.setEnabled(False)
-                    self.effect_combo.blockSignals(False)
+      if kb_buffer:
+        self.device_states["keyboard"]["effect"] = "Custom Lighting"
 
-                if hasattr(self, "lighting_stack") and self.lighting_stack.currentIndex() != 1:
-                    self.lighting_stack.setCurrentIndex(1)
-                    if hasattr(self, "update_mode_button_styles"):
-                        self.update_mode_button_styles("matrix")
+        if hasattr(self, "effect_combo"):
+          self.effect_combo.blockSignals(True)
+          self.effect_combo.setCurrentText("Custom Lighting")
+          if hasattr(self, "current_target") and self.current_target == "keyboard":
+            self.effect_combo.setEnabled(False)
+          self.effect_combo.blockSignals(False)
 
-                if hasattr(self, "restore_keyboard_matrix_buffer"):
-                    self.restore_keyboard_matrix_buffer(kb_buffer)
+        if hasattr(self, "lighting_stack") and self.lighting_stack.currentIndex() != 1:
+          self.lighting_stack.setCurrentIndex(1)
+          if hasattr(self, "update_mode_button_styles"):
+            self.update_mode_button_styles("matrix")
 
-                if hasattr(self, "active_paint_widget") and hasattr(self, "current_target") and self.current_target == "keyboard":
-                    if hasattr(self.active_paint_widget, "load_frame"):
-                        self.active_paint_widget.load_frame(kb_buffer)
-            else:
-                if self.device_states.get("keyboard", {}).get("effect") == "Custom Lighting":
-                    self.device_states["keyboard"]["effect"] = "Static (Custom Color)"
-                    
-                if hasattr(self, "effect_combo") and hasattr(self, "current_target") and self.current_target == "keyboard":
-                    self.effect_combo.setEnabled(True)
-                    current_effect = self.device_states["keyboard"].get("effect", "Static (Custom Color)")
-                    self.effect_combo.blockSignals(True)
-                    self.effect_combo.setCurrentText(current_effect)
-                    self.effect_combo.blockSignals(False)
+        if hasattr(self, "restore_keyboard_matrix_buffer"):
+          self.restore_keyboard_matrix_buffer(kb_buffer)
 
-                if hasattr(self, "clear_keyboard_matrix_buffer"):
-                    try:
-                        self.clear_keyboard_matrix_buffer()
-                    except Exception:
-                        pass
+        if hasattr(self, "active_paint_widget") and hasattr(self, "current_target") and self.current_target == "keyboard":
+          if hasattr(self.active_paint_widget, "load_frame"):
+            self.active_paint_widget.load_frame(kb_buffer)
+      else:
+        if self.device_states.get("keyboard", {}).get("effect") == "Custom Lighting":
+          self.device_states["keyboard"]["effect"] = "Static (Custom Color)"
 
-            # Handle Mouse Zones Buffer
-            mouse_buffer = matrix_data.get("mouse", [])
-            if isinstance(mouse_buffer, list) and mouse_buffer:
-                self.device_states["mouse"]["effect"] = "Custom Lighting"
-                
-                if hasattr(self, "effect_combo"):
-                    self.effect_combo.blockSignals(True)
-                    self.effect_combo.setCurrentText("Custom Lighting")
-                    if hasattr(self, "current_target") and self.current_target == "mouse":
-                        self.effect_combo.setEnabled(False)
-                    self.effect_combo.blockSignals(False)
+        if hasattr(self, "effect_combo") and hasattr(self, "current_target") and self.current_target == "keyboard":
+          self.effect_combo.setEnabled(True)
+          current_effect = self.device_states["keyboard"].get("effect", "Static (Custom Color)")
+          self.effect_combo.blockSignals(True)
+          self.effect_combo.setCurrentText(current_effect)
+          self.effect_combo.blockSignals(False)
 
-                if hasattr(self, "restore_mouse_zones_buffer"):
-                    self.restore_mouse_zones_buffer(mouse_buffer)
-                    
-                if hasattr(self, "active_paint_widget") and hasattr(self, "current_target") and self.current_target == "mouse":
-                    if hasattr(self.active_paint_widget, "load_frame"):
-                        self.active_paint_widget.load_frame(mouse_buffer)
-            else:
-                if hasattr(self, "effect_combo") and hasattr(self, "current_target") and self.current_target == "mouse":
-                    self.effect_combo.setEnabled(True)
+        if hasattr(self, "clear_keyboard_matrix_buffer"):
+          try:
+            self.clear_keyboard_matrix_buffer()
+          except Exception:
+            pass
+
+      mouse_buffer = matrix_data.get("mouse", [])
+      if isinstance(mouse_buffer, list) and len(mouse_buffer) == 3:
+        self.device_states["mouse"]["effect"] = "Custom Lighting"
+
+        if hasattr(self, "effect_combo"):
+          self.effect_combo.blockSignals(True)
+          self.effect_combo.setCurrentText("Custom Lighting")
+          if hasattr(self, "current_target") and self.current_target == "mouse":
+            self.effect_combo.setEnabled(False)
+          self.effect_combo.blockSignals(False)
+
+        self.restore_mouse_zones_buffer(mouse_buffer)
+
+        if hasattr(self, "active_paint_widget") and hasattr(self, "current_target") and self.current_target == "mouse":
+          if hasattr(self.active_paint_widget, "load_frame"):
+            self.active_paint_widget.load_frame(mouse_buffer)
+      else:
+        default_mouse_buf = [
+            list(DEFAULT_SCROLL_RGB),
+            list(DEFAULT_LOGO_RGB),
+            list(DEFAULT_KEYPAD_RGB),
+        ]
+        if hasattr(self.razer, "paint_mouse_zones"):
+          self.razer.paint_mouse_zones()
+        if hasattr(self, "active_paint_widget") and isinstance(self.active_paint_widget, MouseZoneWidget):
+          self.active_paint_widget.load_frame(default_mouse_buf)
+        if hasattr(self, "effect_combo") and hasattr(self, "current_target") and self.current_target == "mouse":
+          self.effect_combo.setEnabled(True)
 
   def select_keyboard_target(self):
-        self.current_target = "keyboard"
-        profile_name = self.get_active_profile_name()
-        prof_data = self.profiles.get(profile_name, {})
-        has_kb_matrix = bool(prof_data.get("matrix", {}).get("keyboard"))
-        
-        if hasattr(self, "effect_combo"):
-            if has_kb_matrix:
-                self.effect_combo.blockSignals(True)
-                self.effect_combo.setCurrentText("Custom Lighting")
-                self.effect_combo.setEnabled(False)
-                self.effect_combo.blockSignals(False)
-            else:
-                self.effect_combo.setEnabled(True)
-                current_effect = self.device_states.get("keyboard", {}).get("effect", "Static (Custom Color)")
-                self.effect_combo.blockSignals(True)
-                self.effect_combo.setCurrentText(current_effect)
-                self.effect_combo.blockSignals(False)
-                
-        if hasattr(self, "refresh_lighting_ui_from_state"):
-            self.refresh_lighting_ui_from_state()
+    self.current_target = "keyboard"
+    profile_name = self.get_active_profile_name()
+    prof_data = self.profiles.get(profile_name, {})
+    has_kb_matrix = bool(prof_data.get("matrix", {}).get("keyboard"))
+
+    if hasattr(self, "effect_combo"):
+      if has_kb_matrix:
+        self.effect_combo.blockSignals(True)
+        self.effect_combo.setCurrentText("Custom Lighting")
+        self.effect_combo.setEnabled(False)
+        self.effect_combo.blockSignals(False)
+      else:
+        self.effect_combo.setEnabled(True)
+        current_effect = self.device_states.get("keyboard", {}).get("effect", "Static (Custom Color)")
+        self.effect_combo.blockSignals(True)
+        self.effect_combo.setCurrentText(current_effect)
+        self.effect_combo.blockSignals(False)
+
+    if hasattr(self, "refresh_lighting_ui_from_state"):
+      self.refresh_lighting_ui_from_state()
 
   def select_mouse_target(self):
-        self.current_target = "mouse"
-        profile_name = self.get_active_profile_name()
-        prof_data = self.profiles.get(profile_name, {})
-        has_mouse_matrix = bool(prof_data.get("matrix", {}).get("mouse"))
-        
-        if hasattr(self, "effect_combo"):
-            if has_mouse_matrix:
-                self.effect_combo.blockSignals(True)
-                self.effect_combo.setCurrentText("Custom Lighting")
-                self.effect_combo.setEnabled(False)
-                self.effect_combo.blockSignals(False)
-            else:
-                self.effect_combo.setEnabled(True)
-                current_effect = self.device_states.get("mouse", {}).get("effect", "Static (Custom Color)")
-                self.effect_combo.blockSignals(True)
-                self.effect_combo.setCurrentText(current_effect)
-                self.effect_combo.blockSignals(False)
+    self.current_target = "mouse"
+    profile_name = self.get_active_profile_name()
+    prof_data = self.profiles.get(profile_name, {})
+    has_mouse_matrix = bool(prof_data.get("matrix", {}).get("mouse"))
 
-        if hasattr(self, "refresh_lighting_ui_from_state"):
-            self.refresh_lighting_ui_from_state()
-            
+    if hasattr(self, "effect_combo"):
+      if has_mouse_matrix:
+        self.effect_combo.blockSignals(True)
+        self.effect_combo.setCurrentText("Custom Lighting")
+        self.effect_combo.setEnabled(False)
+        self.effect_combo.blockSignals(False)
+      else:
+        self.effect_combo.setEnabled(True)
+        current_effect = self.device_states.get("mouse", {}).get("effect", "Static (Custom Color)")
+        self.effect_combo.blockSignals(True)
+        self.effect_combo.setCurrentText(current_effect)
+        self.effect_combo.blockSignals(False)
+
+    if hasattr(self, "refresh_lighting_ui_from_state"):
+      self.refresh_lighting_ui_from_state()
+
   def create_profile(self):
     text, ok = QInputDialog.getText(self, "New Profile", "Enter name:")
     if ok and text.strip() and text.strip() not in self.profiles:

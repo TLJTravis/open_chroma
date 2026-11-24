@@ -9,10 +9,10 @@ echo "=== Installing OpenChroma and System Dependencies ==="
 if command -v apt-get &> /dev/null; then
     echo "[+] Installing system dependencies via apt..."
     sudo apt update
-    sudo apt install -y python3-pyqt6 python3-evdev python3-dbus python3-xlib xdotool openrazer-meta flatpak python3-pip
+    sudo apt install -y python3-pyqt6 python3-evdev python3-dbus python3-xlib xdotool openrazer-meta flatpak python3-pip desktop-file-utils libglib2.0-bin
 elif command -v dnf &> /dev/null; then
     echo "[+] Installing system dependencies via dnf..."
-    sudo dnf install -y python3-qt5 python3-evdev xdotool flatpak python3-pip
+    sudo dnf install -y python3-qt6 python3-evdev python3-dbus xdotool flatpak python3-pip desktop-file-utils glib2
 else
     echo "[!] Unrecognized package manager. Please ensure required dependencies are installed manually."
 fi
@@ -24,8 +24,12 @@ sudo usermod -aG plugdev "$USER" || sudo gpasswd -a "$USER" plugdev || true
 # 2. Install Python Pip Dependencies if requirements.txt exists
 if [ -f "requirements.txt" ]; then
     echo "[+] Installing Python requirements..."
-    pip3 install -r requirements.txt --user
+    pip3 install -r requirements.txt --user --break-system-packages 2>/dev/null || pip3 install -r requirements.txt --user
 fi
+
+# Ensure openrgb-python client library is available for per-zone mouse lighting
+echo "[+] Ensuring openrgb-python client library is installed..."
+pip3 install --user --break-system-packages openrgb-python 2>/dev/null || pip3 install --user openrgb-python 2>/dev/null || true
 
 # 3. Setup OpenRGB Flatpak server for per-zone mouse control
 echo "[+] Checking OpenRGB Flatpak dependency..."
@@ -65,12 +69,12 @@ mkdir -p "$INSTALL_DIR"
 mkdir -p "$DESKTOP_DIR"
 mkdir -p "$ICON_DIR"
 
-# 5. Copy application files from the current repository workspace
-if [ -f "open_chroma_wayland.py" ]; then
-    cp "open_chroma_wayland.py" "$SHARE_DIR/open_chroma_wayland.py"
-    chmod +x "$SHARE_DIR/open_chroma_wayland.py"
+# 5. Copy extensionless application executable, backend, and assets
+if [ -f "openchroma" ]; then
+    cp "openchroma" "$SHARE_DIR/openchroma"
+    chmod +x "$SHARE_DIR/openchroma"
 else
-    echo "Error: open_chroma_wayland.py not found in current directory."
+    echo "Error: openchroma not found in current directory."
     exit 1
 fi
 
@@ -81,30 +85,46 @@ else
     exit 1
 fi
 
-if [ -f "assets/OpenChroma.png" ]; then
-    cp "assets/OpenChroma.png" "$SHARE_DIR/assets/OpenChroma.png"
+if [ -d "assets" ]; then
+    cp -r assets/* "$SHARE_DIR/assets/" 2>/dev/null || true
 fi
 
 # 6. Create a symlink in PATH so users can type 'openchroma' anywhere
-ln -sf "$SHARE_DIR/open_chroma_wayland.py" "$INSTALL_DIR/openchroma"
+ln -sf "$SHARE_DIR/openchroma" "$INSTALL_DIR/openchroma"
 
-# 7. Install desktop file and icon if available
-if [ -f "open_chroma.desktop" ]; then
-    cp "open_chroma.desktop" "$DESKTOP_DIR/"
-fi
-
+# 7. Install icon and .desktop file into program launcher
 if [ -f "$SHARE_DIR/assets/OpenChroma.png" ]; then
-    cp "$SHARE_DIR/assets/OpenChroma.png" "$ICON_DIR/OpenChroma.png"
+    cp "$SHARE_DIR/assets/OpenChroma.png" "$ICON_DIR/openchroma.png"
     gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor/" 2>/dev/null || true
 fi
 
-update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
-
-# Dynamically update the installed desktop file with absolute paths
-if [ -f "$DESKTOP_DIR/open_chroma.desktop" ]; then
-    sed -i "s|Exec=open_chroma|Exec=$INSTALL_DIR/openchroma|g" "$DESKTOP_DIR/open_chroma.desktop"
-    sed -i "s|Icon=openchroma|Icon=$ICON_DIR/OpenChroma.png|g" "$DESKTOP_DIR/open_chroma.desktop"
+DESKTOP_SRC=""
+if [ -f "openchroma.desktop" ]; then
+    DESKTOP_SRC="openchroma.desktop"
+elif [ -f "open_chroma.desktop" ]; then
+    DESKTOP_SRC="open_chroma.desktop"
 fi
+
+if [ -n "$DESKTOP_SRC" ]; then
+    cp "$DESKTOP_SRC" "$DESKTOP_DIR/openchroma.desktop"
+    grep -q "^Categories=" "$DESKTOP_DIR/openchroma.desktop" || echo "Categories=Utility;" >> "$DESKTOP_DIR/openchroma.desktop"
+    sed -i "s|^Exec=.*|Exec=$INSTALL_DIR/openchroma|g" "$DESKTOP_DIR/openchroma.desktop"
+    sed -i "s|^Icon=.*|Icon=$ICON_DIR/openchroma.png|g" "$DESKTOP_DIR/openchroma.desktop"
+else
+    cat << EOF > "$DESKTOP_DIR/openchroma.desktop"
+[Desktop Entry]
+Type=Application
+Name=OpenChroma
+Comment=Razer RGB Device & Profile Manager
+Exec=$INSTALL_DIR/openchroma
+Icon=$ICON_DIR/openchroma.png
+Terminal=false
+Categories=Utility;
+EOF
+fi
+
+chmod +x "$DESKTOP_DIR/openchroma.desktop"
+update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
 
 # 8. Enable and start daemons
 systemctl --user daemon-reload
